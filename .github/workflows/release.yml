@@ -119,7 +119,8 @@ jobs:
         run: |
           set -euxo pipefail
 
-          mkdir -p /tmp/osxfuse_sdk /usr/local/include/fuse
+          FUSE_INCLUDE="$RUNNER_TEMP/fuse-include"
+          mkdir -p /tmp/osxfuse_sdk "$FUSE_INCLUDE"
 
           if [ ! -d /tmp/osxfuse_sdk/.git ]; then
             git clone --depth 1 https://github.com/osxfuse/fuse.git /tmp/osxfuse_sdk || true
@@ -129,8 +130,8 @@ jobs:
             for file in /tmp/osxfuse_sdk/include/*; do
               [ -e "$file" ] || continue
               base="$(basename "$file")"
-              if [ ! -e "/usr/local/include/fuse/$base" ]; then
-                cp -v "$file" "/usr/local/include/fuse/$base"
+              if [ ! -e "$FUSE_INCLUDE/$base" ]; then
+                cp -v "$file" "$FUSE_INCLUDE/$base"
               fi
             done
           fi
@@ -139,16 +140,16 @@ jobs:
             for file in /tmp/osxfuse_sdk/include/fuse/*; do
               [ -e "$file" ] || continue
               base="$(basename "$file")"
-              if [ ! -e "/usr/local/include/fuse/$base" ]; then
-                cp -v "$file" "/usr/local/include/fuse/$base"
+              if [ ! -e "$FUSE_INCLUDE/$base" ]; then
+                cp -v "$file" "$FUSE_INCLUDE/$base"
               fi
             done
           fi
 
-          echo "CGO_ENABLED=1" >> $GITHUB_ENV
-          echo "CPATH=/tmp/osxfuse_sdk/include:/usr/local/include/fuse" >> $GITHUB_ENV
-          echo "C_INCLUDE_PATH=/tmp/osxfuse_sdk/include:/usr/local/include/fuse" >> $GITHUB_ENV
-          echo "CGO_CFLAGS=-I/tmp/osxfuse_sdk/include -I/usr/local/include/fuse -D_FILE_OFFSET_BITS=64" >> $GITHUB_ENV
+          echo "CGO_ENABLED=1" >> "$GITHUB_ENV"
+          echo "CPATH=$FUSE_INCLUDE" >> "$GITHUB_ENV"
+          echo "C_INCLUDE_PATH=$FUSE_INCLUDE" >> "$GITHUB_ENV"
+          echo "CGO_CFLAGS=-I$FUSE_INCLUDE -D_FILE_OFFSET_BITS=64" >> "$GITHUB_ENV"
 
       - name: Build Go Executable (${{ matrix.os_name }})
         shell: bash

@@ -6,20 +6,21 @@ use crate::vault::{
 };
 use eframe::egui;
 use std::fs::File;
-use std::io::BufWriter;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub fn run_app() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1260.0, 760.0])
+            .with_inner_size([1280.0, 760.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(
-        "🔐 SecureUSB Explorer (Rust) — SVAULT03 • Auto-USB • KeyWrap • Rayon SIMD",
+        "🔐 SecureUSB Explorer (Rust) — SVAULT03 • Dual-Vault • BLAKE3 Dedup • Reed-Solomon ECC",
         options,
         Box::new(|cc| {
             apply_cyber_dark_theme(&cc.egui_ctx);
@@ -30,13 +31,20 @@ pub fn run_app() -> eframe::Result<()> {
 
 fn apply_cyber_dark_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = egui::Color32::from_rgb(15, 23, 42); // Slate 900
-    visuals.window_fill = egui::Color32::from_rgb(30, 41, 59); // Slate 800
+    visuals.panel_fill = egui::Color32::from_rgb(15, 23, 42);
+    visuals.window_fill = egui::Color32::from_rgb(30, 41, 59);
     visuals.extreme_bg_color = egui::Color32::from_rgb(10, 15, 28);
-    visuals.selection.bg_fill = egui::Color32::from_rgb(16, 185, 129); // Emerald accent
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(16, 185, 129);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
     ctx.set_visuals(visuals);
 }
+
+enum BgTaskOutcome {
+    Unlocked(io::Result<Arc<SecureVault>>),
+    Message(String),
+}
+
+use std::io;
 
 enum PreviewState {
     None,
@@ -76,9 +84,10 @@ struct SecureUsbApp {
     selected_is_dir: bool,
     preview: PreviewState,
     new_item_name: String,
-    show_pwd_modal: bool,
-    old_pwd_input: String,
-    new_pwd_input: String,
+    show_shadow_modal: bool,
+    shadow_pwd_input: String,
+    busy_title: Option<String>,
+    busy_rx: Option<Receiver<BgTaskOutcome>>,
 }
 
 impl SecureUsbApp {
@@ -104,10 +113,23 @@ impl SecureUsbApp {
             selected_is_dir: false,
             preview: PreviewState::None,
             new_item_name: String::new(),
-            show_pwd_modal: false,
-            old_pwd_input: String::new(),
-            new_pwd_input: String::new(),
+            show_shadow_modal: false,
+            shadow_pwd_input: String::new(),
+            busy_title: None,
+            busy_rx: None,
         }
+    }
+
+    fn spawn_busy_task<F>(&mut self, title: impl Into<String>, task: F)
+    where
+        F: FnOnce() -> BgTaskOutcome + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        self.busy_title = Some(title.into());
+        self.busy_rx = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(task());
+        });
     }
 
     fn refresh_dir(&mut self) {
@@ -169,7 +191,13 @@ impl SecureUsbApp {
             return;
         }
 
-        if let Ok(bytes) = v.read_file(&entry.virtual_path) {
+        let read_res = if !entry.chunk_refs.is_empty() {
+            v.read_dedup_file(&entry.virtual_path)
+        } else {
+            v.read_file(&entry.virtual_path)
+        };
+
+        if let Ok(bytes) = read_res {
             if let Ok(txt) = String::from_utf8(bytes) {
                 self.preview = PreviewState::Text {
                     path: entry.virtual_path.clone(),
@@ -184,90 +212,6 @@ impl SecureUsbApp {
             }
         }
     }
-
-    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if dropped.is_empty() {
-            return;
-        }
-
-        if self.vault.is_none() {
-            if let Some(first_path) = dropped.first().and_then(|d| d.path.as_ref()) {
-                self.usb_path = first_path.display().to_string();
-            }
-            return;
-        }
-
-        let Some(v) = self.vault.clone() else { return };
-        let cur_dir = if self.current_dir.is_empty() {
-            "/".to_string()
-        } else {
-            self.current_dir.clone()
-        };
-
-        let mut total_imported = 0usize;
-        for df in dropped {
-            let Some(path) = df.path else { continue };
-            if should_ignore_entry(&path) {
-                continue;
-            }
-            if path.is_dir() {
-                match v.import_dir(&path, &cur_dir) {
-                    Ok(cnt) => total_imported += cnt,
-                    Err(e) => self.status_msg = format!("Errore Drag & Drop cartella: {e}"),
-                }
-            } else if path.is_file() {
-                if let Ok(f) = File::open(&path) {
-                    let fname = path.file_name().unwrap_or_default().to_string_lossy();
-                    let target = format!("{cur_dir}/{fname}");
-                    match v.write_stream(&target, f) {
-                        Ok(()) => total_imported += 1,
-                        Err(e) => self.status_msg = format!("Errore Drag & Drop file: {e}"),
-                    }
-                }
-            }
-        }
-
-        self.status_msg = format!(
-            "✅ Drag & Drop: {total_imported} file cifrati in '{cur_dir}'!"
-        );
-        self.refresh_dir();
-    }
-}
-
-fn estimate_entropy_bits(pw: &str) -> f32 {
-    if pw.is_empty() {
-        return 0.0;
-    }
-    let mut lower = false;
-    let mut upper = false;
-    let mut digit = false;
-    let mut sym = false;
-    for ch in pw.chars() {
-        if ch.is_ascii_lowercase() {
-            lower = true;
-        } else if ch.is_ascii_uppercase() {
-            upper = true;
-        } else if ch.is_ascii_digit() {
-            digit = true;
-        } else {
-            sym = true;
-        }
-    }
-    let mut pool = 0.0f32;
-    if lower {
-        pool += 26.0;
-    }
-    if upper {
-        pool += 26.0;
-    }
-    if digit {
-        pool += 10.0;
-    }
-    if sym {
-        pool += 32.0;
-    }
-    (pw.chars().count() as f32) * pool.log2()
 }
 
 fn format_bytes(b: u64) -> String {
@@ -289,45 +233,70 @@ fn format_bytes(b: u64) -> String {
 
 impl eframe::App for SecureUsbApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_dropped_files(ctx);
+        // 1. Controlla se un'operazione asincrona con Spinner è terminata
+        if let Some(rx) = &self.busy_rx {
+            if let Ok(outcome) = rx.try_recv() {
+                self.busy_title = None;
+                self.busy_rx = None;
+                match outcome {
+                    BgTaskOutcome::Unlocked(Ok(v)) => {
+                        let mode = if v.is_shadow_session() {
+                            "🕵️ Sessione SHADOW VAULT (Nascosta) sbloccata!"
+                        } else {
+                            "✅ Sessione Vault Primario sbloccata!"
+                        };
+                        self.status_msg = mode.to_string();
+                        self.vault = Some(v);
+                        self.current_dir = "/".to_string();
+                        self.password.clear();
+                        self.refresh_dir();
+                    }
+                    BgTaskOutcome::Unlocked(Err(e)) => {
+                        self.status_msg = format!("❌ Errore: {e}");
+                    }
+                    BgTaskOutcome::Message(msg) => {
+                        self.status_msg = msg;
+                        self.refresh_dir();
+                    }
+                }
+            } else {
+                ctx.request_repaint();
+            }
+        }
 
-        // Hot-Plug polling & Watchdog anti-rimozione USB ogni 2.5 secondi
+        // 2. Disegna il Modal di Caricamento con Spinner quando busy_title è attivo
+        if let Some(title) = &self.busy_title {
+            egui::Window::new("⏳ Operazione Crittografica in Corso")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.heading(title);
+                    });
+                    ui.label("Elaborazione Multi-Core (Argon2id / BLAKE3 / Reed-Solomon GF(256) / XChaCha20)...");
+                });
+        }
+
         if self.last_usb_scan.elapsed() >= Duration::from_millis(2500) {
             self.last_usb_scan = Instant::now();
             if let Some(v) = &self.vault {
                 if !v.is_mount_alive() {
-                    self.vault = None; // Zeroize immediato della MasterKey in RAM!
+                    self.vault = None;
                     self.entries.clear();
                     self.preview = PreviewState::None;
-                    self.status_msg = "🔒 Blocco di emergenza: chiavetta USB rimossa, chiave azzerata in RAM!".to_string();
+                    self.status_msg = "🔒 Chiavetta USB rimossa: chiave azzerata in RAM!".to_string();
                 }
             } else {
                 self.detected_drives = detect_usb_drives();
-                if self.usb_path.is_empty() {
-                    if let Some(first) = self.detected_drives.first() {
-                        self.usb_path = first.mount_path.clone();
-                    }
-                }
             }
         }
 
-        let is_hovering_files = !ctx.input(|i| i.raw.hovered_files.is_empty());
-        if is_hovering_files {
-            egui::Area::new(egui::Id::new("drag_drop_banner"))
-                .fixed_pos(egui::pos2(320.0, 260.0))
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.heading("📥 Rilascia qui file o cartelle per importarli in SVAULT03");
-                        ui.label("I file temporanei (.DS_Store, Thumbs.db, desktop.ini, *.tmp) vengono filtrati in automatico.");
-                    });
-                });
-        }
-
-        // Schermata di Sblocco con Auto-Detection USB
         if self.vault.is_none() {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("🔐 Sblocco e Gestione Chiavetta Cifrata (Rust SVAULT03)");
-                ui.label("Rilevamento Automatico USB • Argon2id • XChaCha20-Poly1305 In-Place SIMD • Zstd Adattivo");
+                ui.heading("🔐 Sblocco e Gestione Chiavetta Cifrata (SVAULT03 + Shadow Vault + ECC)");
+                ui.label("Inserisci la Password Primaria per aprire il Vault standard oppure la Password Segreta per aprire lo Shadow Vault.");
                 ui.add_space(10.0);
 
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -353,9 +322,6 @@ impl eframe::App for SecureUsbApp {
 
                         if ui.button("🔄 Aggiorna USB").clicked() {
                             self.detected_drives = detect_usb_drives();
-                            if let Some(first) = self.detected_drives.first() {
-                                self.usb_path = first.mount_path.clone();
-                            }
                         }
                     });
 
@@ -370,60 +336,43 @@ impl eframe::App for SecureUsbApp {
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label("Password Master:");
+                        ui.label("Password (Primaria o Shadow):");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.password)
                                 .password(true)
                                 .desired_width(320.0),
                         );
-                        let bits = estimate_entropy_bits(&self.password);
-                        ui.add(
-                            egui::ProgressBar::new((bits / 128.0).clamp(0.0, 1.0))
-                                .text(format!("Entropia: {bits:.0} bit"))
-                                .desired_width(180.0),
-                        );
                     });
 
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("🔓 Sblocca Vault Esistente").clicked() {
-                            match SecureVault::init_or_open(&self.usb_path, &self.password, false) {
-                                Ok(v) => {
-                                    self.vault = Some(v);
-                                    self.current_dir = "/".to_string();
-                                    self.password.clear();
-                                    self.refresh_dir();
-                                }
-                                Err(e) => self.status_msg = format!("Errore: {e}"),
-                            }
+                        if ui.button("🔓 Sblocca Vault (Auto-Slot + ECC Heal)").clicked() && self.busy_rx.is_none() {
+                            let path = self.usb_path.clone();
+                            let pass = self.password.clone();
+                            self.spawn_busy_task("Sblocco Vault e Verifica Reed-Solomon ECC...", move || {
+                                BgTaskOutcome::Unlocked(SecureVault::init_or_open(path, &pass, false))
+                            });
                         }
-                        if ui.button("✨ Inizializza Nuovo Vault (SVAULT03)").clicked() {
-                            match SecureVault::init_or_open(&self.usb_path, &self.password, true) {
-                                Ok(v) => {
-                                    self.vault = Some(v);
-                                    self.current_dir = "/".to_string();
-                                    self.password.clear();
-                                    self.refresh_dir();
-                                }
-                                Err(e) => self.status_msg = format!("Errore: {e}"),
-                            }
+                        if ui.button("✨ Inizializza Nuovo Vault Dual-Slot").clicked() && self.busy_rx.is_none() {
+                            let path = self.usb_path.clone();
+                            let pass = self.password.clone();
+                            self.spawn_busy_task("Inizializzazione Dual-Slot + Shadow Index + Parità ECC...", move || {
+                                BgTaskOutcome::Unlocked(SecureVault::init_or_open(path, &pass, true))
+                            });
                         }
                     });
                 });
 
                 ui.add_space(12.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.heading("🛠️ Formattazione Hardware USB in exFAT (Windows / Linux / macOS)");
+                    ui.heading("🛠️ Formattazione Hardware USB in exFAT");
                     ui.horizontal(|ui| {
                         ui.label("Dispositivo (es. E:, /dev/sdb1, /dev/disk2):");
                         ui.text_edit_singleline(&mut self.raw_device);
                         if ui.button("Formatta in exFAT").clicked() {
                             match format_physical_usb(&self.raw_device, "SECURE_USB") {
-                                Ok(()) => {
-                                    self.detected_drives = detect_usb_drives();
-                                    self.status_msg = "✅ Formattazione exFAT completata!".to_string();
-                                }
-                                Err(e) => self.status_msg = format!("Errore formattazione: {e}"),
+                                Ok(()) => self.status_msg = "✅ Formattazione exFAT completata!".to_string(),
+                                Err(e) => self.status_msg = format!("Errore: {e}"),
                             }
                         }
                     });
@@ -437,45 +386,38 @@ impl eframe::App for SecureUsbApp {
             return;
         }
 
-        // Finestra Modale per Cambio Password Istantaneo (Key Wrapping)
-        if self.show_pwd_modal {
-            egui::Window::new("🔑 Cambio Password Istantaneo (Key Wrapping)")
+        if self.show_shadow_modal {
+            egui::Window::new("🕵️ Plausible Deniability — Configura Secondo Vault Nascosto")
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label("La Data Encryption Key (DEK) verrà ri-avvolta senza ricifrare i file:");
+                    ui.label("Imposta una seconda password segreta per attivare lo Slot 1 e index.shadow:");
                     ui.horizontal(|ui| {
-                        ui.label("Password Attuale:");
-                        ui.add(egui::TextEdit::singleline(&mut self.old_pwd_input).password(true));
+                        ui.label("Password Segreta Shadow:");
+                        ui.add(egui::TextEdit::singleline(&mut self.shadow_pwd_input).password(true));
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Nuova Password:");
-                        ui.add(egui::TextEdit::singleline(&mut self.new_pwd_input).password(true));
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("✅ Aggiorna Password").clicked() {
-                            if let Some(v) = &self.vault {
-                                match v.change_password(&self.old_pwd_input, &self.new_pwd_input) {
-                                    Ok(()) => {
-                                        self.status_msg = "✅ Password aggiornata istantaneamente tramite Key Wrapping!".to_string();
-                                        self.show_pwd_modal = false;
+                        if ui.button("✅ Attiva Shadow Vault").clicked() && self.busy_rx.is_none() {
+                            if let Some(v) = self.vault.clone() {
+                                let spw = self.shadow_pwd_input.clone();
+                                self.show_shadow_modal = false;
+                                self.shadow_pwd_input.clear();
+                                self.spawn_busy_task("Configurazione Shadow Vault (Slot 1 + ECC)...", move || {
+                                    match v.configure_shadow_vault(&spw) {
+                                        Ok(()) => BgTaskOutcome::Message("🕵️ Shadow Vault configurato con successo!".to_string()),
+                                        Err(e) => BgTaskOutcome::Message(format!("❌ Errore Shadow Vault: {e}")),
                                     }
-                                    Err(e) => self.status_msg = format!("❌ Errore cambio password: {e}"),
-                                }
+                                });
                             }
-                            self.old_pwd_input.clear();
-                            self.new_pwd_input.clear();
                         }
                         if ui.button("Annulla").clicked() {
-                            self.old_pwd_input.clear();
-                            self.new_pwd_input.clear();
-                            self.show_pwd_modal = false;
+                            self.shadow_pwd_input.clear();
+                            self.show_shadow_modal = false;
                         }
                     });
                 });
         }
 
-        // Barra Superiore (Azioni + Breadcrumbs Interattivi + Ricerca Istantanea RAM)
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("⬆ Su").clicked() && self.current_dir != "/" {
@@ -487,7 +429,7 @@ impl eframe::App for SecureUsbApp {
                     self.refresh_dir();
                 }
 
-                ui.add(egui::TextEdit::singleline(&mut self.new_item_name).hint_text("Nome nuovo...").desired_width(110.0));
+                ui.add(egui::TextEdit::singleline(&mut self.new_item_name).hint_text("Nome nuovo...").desired_width(105.0));
                 if ui.button("📁 +Cartella").clicked() && !self.new_item_name.trim().is_empty() {
                     if let Some(v) = self.vault.clone() {
                         let target = format!("{}/{}", self.current_dir, self.new_item_name.trim());
@@ -505,31 +447,33 @@ impl eframe::App for SecureUsbApp {
                     }
                 }
 
-                if ui.button("📥 Importa File").clicked() {
+                if ui.button("📥 Importa Dedup (BLAKE3)").clicked() && self.busy_rx.is_none() {
                     if let Some(path) = rfd::FileDialog::new().pick_file() {
                         if !should_ignore_entry(&path) {
                             if let (Some(v), Ok(f)) = (self.vault.clone(), File::open(&path)) {
-                                let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                                let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                                 let target = format!("{}/{}", self.current_dir, fname);
-                                if let Err(e) = v.write_stream(&target, f) {
-                                    self.status_msg = format!("Errore import: {e}");
-                                }
-                                self.refresh_dir();
+                                self.spawn_busy_task(format!("Deduplicazione BLAKE3 e Cifratura di {fname}..."), move || {
+                                    match v.write_stream_dedup(&target, f) {
+                                        Ok(hits) => BgTaskOutcome::Message(format!("✅ Importato {fname} ({hits} chunk da 4MB deduplicati con BLAKE3)!")),
+                                        Err(e) => BgTaskOutcome::Message(format!("❌ Errore import: {e}")),
+                                    }
+                                });
                             }
                         }
                     }
                 }
 
-                if ui.button("📁📥 Importa Cartella").clicked() {
+                if ui.button("📁📥 Importa Cartella").clicked() && self.busy_rx.is_none() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         if let Some(v) = self.vault.clone() {
-                            match v.import_dir(&folder, &self.current_dir) {
-                                Ok(count) => {
-                                    self.status_msg = format!("✅ Importati {count} file dalla cartella!");
-                                    self.refresh_dir();
+                            let cur = self.current_dir.clone();
+                            self.spawn_busy_task("Importazione Ricorsiva Cartella Multi-Core...", move || {
+                                match v.import_dir(&folder, &cur) {
+                                    Ok(cnt) => BgTaskOutcome::Message(format!("✅ Importati {cnt} file dalla cartella!")),
+                                    Err(e) => BgTaskOutcome::Message(format!("❌ Errore: {e}")),
                                 }
-                                Err(e) => self.status_msg = format!("Errore import cartella: {e}"),
-                            }
+                            });
                         }
                     }
                 }
@@ -542,61 +486,24 @@ impl eframe::App for SecureUsbApp {
                     }
                 }
 
-                if ui.button("📤 Esporta File").clicked() {
-                    if let (Some(v), Some(sel)) = (&self.vault, &self.selected_path) {
-                        if !self.selected_is_dir {
-                            if let Some(dest) = rfd::FileDialog::new().save_file() {
-                                if let Ok(out) = File::create(dest) {
-                                    let _ = v.read_stream(sel, BufWriter::new(out));
-                                }
-                            }
-                        }
-                    }
+                if ui.button("🕵️ Shadow Vault").clicked() {
+                    self.show_shadow_modal = true;
                 }
 
-                if ui.button("📁📤 Esporta Cartella").clicked() {
-                    if let Some(dest_folder) = rfd::FileDialog::new().pick_folder() {
-                        if let Some(v) = self.vault.clone() {
-                            let target_dir = if self.selected_is_dir {
-                                self.selected_path.clone().unwrap_or_else(|| self.current_dir.clone())
-                            } else {
-                                self.current_dir.clone()
-                            };
-                            match v.export_dir(&target_dir, &dest_folder) {
-                                Ok(count) => {
-                                    self.status_msg = format!(
-                                        "✅ Esportati {count} file da '{target_dir}' in '{}'!",
-                                        dest_folder.display()
-                                    );
-                                }
-                                Err(e) => self.status_msg = format!("Errore export cartella: {e}"),
-                            }
-                        }
-                    }
-                }
-
-                if ui.button("🛡️ Scrub Poly1305").clicked() {
+                if ui.button("🛡️ Scrub Poly1305").clicked() && self.busy_rx.is_none() {
                     if let Some(v) = self.vault.clone() {
-                        let rep = v.scrub_integrity();
-                        if rep.corrupted_files.is_empty() {
-                            self.status_msg = format!(
-                                "✅ Integrità 100%: {} file ({} chunk, {}) verificati senza errori!",
-                                rep.total_files,
-                                rep.verified_chunks,
-                                format_bytes(rep.verified_bytes)
-                            );
-                        } else {
-                            self.status_msg = format!(
-                                "❌ Rilevati {} file corrotti: {:?}",
-                                rep.corrupted_files.len(),
-                                rep.corrupted_files
-                            );
-                        }
+                        self.spawn_busy_task("Verifica Integrità Globale Poly1305 + Reed-Solomon...", move || {
+                            let rep = v.scrub_integrity();
+                            if rep.corrupted_files.is_empty() {
+                                BgTaskOutcome::Message(format!(
+                                    "✅ Integrità 100%: {} file ({} chunk) verificati!",
+                                    rep.total_files, rep.verified_chunks
+                                ))
+                            } else {
+                                BgTaskOutcome::Message(format!("❌ Corrotti: {:?}", rep.corrupted_files))
+                            }
+                        });
                     }
-                }
-
-                if ui.button("🔑 Password").clicked() {
-                    self.show_pwd_modal = true;
                 }
 
                 if ui.button("🗑 Elimina").clicked() {
@@ -616,71 +523,42 @@ impl eframe::App for SecureUsbApp {
             });
 
             ui.separator();
-
-            // Barra Breadcrumb Interattiva + Barra di Ricerca Istantanea in RAM
-            let mut jump_dir: Option<String> = None;
             ui.horizontal(|ui| {
-                if ui.button("🏠 / Root").clicked() {
-                    jump_dir = Some("/".to_string());
-                }
-                if self.current_dir != "/" {
-                    let mut accum = String::new();
-                    for seg in self.current_dir.trim_matches('/').split('/') {
-                        accum.push('/');
-                        accum.push_str(seg);
-                        let target = accum.clone();
-                        ui.label("❯");
-                        if ui.button(seg).clicked() {
-                            jump_dir = Some(target);
-                        }
-                    }
-                }
+                let mode_badge = if self
+                    .vault
+                    .as_ref()
+                    .map(|v| v.is_shadow_session())
+                    .unwrap_or(false)
+                {
+                    "🕵️ [SHADOW VAULT ATTIVO]"
+                } else {
+                    "🔐 [VAULT PRIMARIO]"
+                };
+                ui.strong(mode_badge);
+                ui.label(format!("Percorso: {}", self.current_dir));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !self.search_query.is_empty() && ui.button("✖").clicked() {
-                        self.search_query.clear();
-                        self.refresh_dir();
-                    }
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
                             .hint_text("🔍 Cerca istantaneamente in RAM...")
-                            .desired_width(260.0),
+                            .desired_width(250.0),
                     );
                     if resp.changed() {
                         self.refresh_dir();
                     }
                 });
             });
-
-            if let Some(jd) = jump_dir {
-                self.search_query.clear();
-                self.current_dir = jd;
-                self.refresh_dir();
-            }
         });
 
-        // Barra Telemetrica Inferiore (Statistiche Spazio e Risparmio Compressione Zstd)
         egui::TopBottomPanel::bottom("telemetry_footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let saved = self.stats.original_size.saturating_sub(self.stats.disk_size);
-                let pct = if self.stats.original_size > 0 {
-                    (saved as f32 / self.stats.original_size as f32) * 100.0
-                } else {
-                    0.0
-                };
                 ui.label(format!(
-                    "📊 Vault: {} File, {} Cartelle ({} Chunk 4MB)  |  Reale: {}  ➔  Su USB (Zstd+AEAD): {}",
+                    "📊 File: {} | Cartelle: {} | Reale: {} ➔ Su USB: {} | ECC Reed-Solomon GF(256) Attivo",
                     self.stats.total_files,
                     self.stats.total_folders,
-                    self.stats.total_chunks,
                     format_bytes(self.stats.original_size),
                     format_bytes(self.stats.disk_size),
                 ));
-                ui.add(
-                    egui::ProgressBar::new((pct / 100.0).clamp(0.0, 1.0))
-                        .text(format!("Risparmio Zstd: {pct:.1}%"))
-                        .desired_width(180.0),
-                );
                 if !self.status_msg.is_empty() {
                     ui.colored_label(egui::Color32::LIGHT_GREEN, &self.status_msg);
                 }
@@ -689,34 +567,19 @@ impl eframe::App for SecureUsbApp {
 
         egui::SidePanel::left("file_list")
             .resizable(true)
-            .default_width(410.0)
+            .default_width(400.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let entries_clone = self.entries.clone();
-                    let is_searching = !self.search_query.trim().is_empty();
                     for e in entries_clone {
-                        let name = if is_searching {
-                            e.virtual_path.clone()
-                        } else {
-                            Path::new(&e.virtual_path)
-                                .file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_else(|| e.virtual_path.clone())
-                        };
+                        let name = Path::new(&e.virtual_path)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| e.virtual_path.clone());
                         let label = if e.is_dir {
                             format!("📁 {name}/")
                         } else {
-                            let ratio = if e.original_size > 0 {
-                                (e.disk_size as f64 / e.original_size as f64) * 100.0
-                            } else {
-                                100.0
-                            };
-                            format!(
-                                "📄 {name}  ({} ➔ {} | {:.0}%)",
-                                format_bytes(e.original_size),
-                                format_bytes(e.disk_size),
-                                ratio
-                            )
+                            format!("📄 {name} ({} ➔ {})", format_bytes(e.original_size), format_bytes(e.disk_size))
                         };
                         let is_sel = self.selected_path.as_deref() == Some(&e.virtual_path);
                         if ui.selectable_label(is_sel, label).clicked() {
@@ -727,14 +590,13 @@ impl eframe::App for SecureUsbApp {
             });
 
         let mut save_target: Option<(String, Vec<u8>)> = None;
-
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.preview {
             PreviewState::None => {
-                ui.label("Seleziona un file dalla lista o trascina file/cartelle dal computer dentro questa finestra.");
+                ui.label("Seleziona un file dalla lista o usa 'Importa Dedup (BLAKE3)' / 'Shadow Vault'.");
             }
             PreviewState::Text { path, content } => {
                 ui.horizontal(|ui| {
-                    ui.heading(format!("📝 Editor Testo in RAM: {path}"));
+                    ui.heading(format!("📝 Editor Testo: {path}"));
                     if ui.button("💾 Salva Modifiche").clicked() {
                         save_target = Some((path.clone(), content.as_bytes().to_vec()));
                     }
@@ -748,60 +610,31 @@ impl eframe::App for SecureUsbApp {
                     );
                 });
             }
-            PreviewState::Image {
-                path,
-                texture,
-                dims,
-            } => {
-                ui.heading(format!(
-                    "🖼️ Visualizzatore Immagini RAM (Zero-Temp): {path} ({}x{} px)",
-                    dims.0, dims.1
-                ));
-                ui.separator();
+            PreviewState::Image { path, texture, dims } => {
+                ui.heading(format!("🖼️ Immagine RAM: {path} ({}x{} px)", dims.0, dims.1));
                 ui.image((texture.id(), ui.available_size()));
             }
-            PreviewState::Pdf {
-                path,
-                pages,
-                current_page,
-            } => {
+            PreviewState::Pdf { path, pages, current_page } => {
                 ui.horizontal(|ui| {
-                    ui.heading(format!(
-                        "📕 Visualizzatore PDF RAM: {path} (Pagina {} di {})",
-                        *current_page + 1,
-                        pages.len()
-                    ));
-                    if ui.button("◀ Prec").clicked() && *current_page > 0 {
+                    ui.heading(format!("📕 PDF RAM: {path} (Pag. {}/{})", *current_page + 1, pages.len()));
+                    if ui.button("◀").clicked() && *current_page > 0 {
                         *current_page -= 1;
                     }
-                    if ui.button("Succ ▶").clicked() && *current_page + 1 < pages.len() {
+                    if ui.button("▶").clicked() && *current_page + 1 < pages.len() {
                         *current_page += 1;
                     }
                 });
-                ui.separator();
                 let mut page_txt = pages[*current_page].clone();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut page_txt)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(28),
-                    );
-                });
+                ui.add(egui::TextEdit::multiline(&mut page_txt).desired_width(f32::INFINITY).desired_rows(28));
             }
             PreviewState::LargeFile { path, size, chunks } => {
-                ui.heading(format!("🎬 File Multimediale / Grande: {path}"));
-                ui.label(format!(
-                    "Dimensione: {} suddivisi in {chunks} chunk indipendenti da 4 MB.",
-                    format_bytes(*size)
-                ));
-                ui.label("Clicca '▶ Stream Video O(1)' nella barra superiore per riprodurlo immediatamente senza file temporanei.");
+                ui.heading(format!("🎬 File Multimediale: {path} ({}, {chunks} chunk)", format_bytes(*size)));
             }
         });
 
         if let Some((path, data)) = save_target {
             if let Some(v) = &self.vault {
                 let _ = v.write_file(&path, &data);
-                self.status_msg = format!("✅ Salvato {path} in SVAULT03!");
             }
             self.refresh_dir();
         }

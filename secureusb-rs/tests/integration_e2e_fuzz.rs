@@ -206,9 +206,9 @@ fn test_change_password_and_verify_integrity_scrubbing() {
     vault.write_file("/docs/segreto.txt", &test_data).unwrap();
 
     // 1. Verifica integrità iniziale
-    let rep = vault.verify_integrity();
-    assert_eq!(rep.files_checked, 1);
-    assert_eq!(rep.chunks_verified, 1);
+    let rep = vault.scrub_integrity();
+    assert_eq!(rep.total_files, 1);
+    assert_eq!(rep.verified_chunks, 1);
     assert!(rep.corrupted_files.is_empty());
 
     // 2. Cambio password con password vecchia errata deve fallire
@@ -237,7 +237,7 @@ fn test_change_password_and_verify_integrity_scrubbing() {
     raw_bytes[HEADER_SIZE + 20] ^= 0xFF; // corruzione bit-flip nel ciphertext
     fs::write(&blob_path, &raw_bytes).unwrap();
 
-    let rep_corrupted = vault_reopened.verify_integrity();
+    let rep_corrupted = vault_reopened.scrub_integrity();
     assert_eq!(rep_corrupted.corrupted_files.len(), 1);
     assert!(rep_corrupted.corrupted_files[0].contains("/docs/segreto.txt"));
 }

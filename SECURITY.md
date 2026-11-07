@@ -1,37 +1,38 @@
-# Security Policy & Threat Model
+# Security Policy & Threat Model (v0.4.0)
 
-## Cryptographic Specifications (SVAULT03)
+## Cryptographic & Resilience Primitives
 
-| Primitive | Algorithm / Parameter | Purpose |
+| Component | Algorithm / Specification | Security Role |
 | :--- | :--- | :--- |
-| **Key Derivation (KDF)** | `Argon2id (v0x13)` — 64 MiB RAM, $t=3$, $p=4$, 16B Salt | Protects master password against GPU/ASIC cracking |
-| **Symmetric AEAD** | `XChaCha20-Poly1305` (256-bit key, 192-bit nonce, 128-bit tag) | Authenticated encryption per 4 MB chunk |
-| **Stream Integrity** | Rogaway `STREAM` construction (Chunk Counter + EOF Flag in Nonce & AAD) | Prevents chunk reordering, truncation, and splice attacks |
-| **Compression** | `Zstandard (Zstd)` applied per-chunk *before* encryption | Eliminates plaintext redundancy; verified by Poly1305 *before* decompression |
-| **Memory Hygiene (Rust)** | `zeroize::ZeroizeOnDrop` + `libc::mlock` | Prevents master key swapping to disk and zeroes RAM on lock |
+| **Key Derivation (KDF)** | `Argon2id (v0x13)` — 64 MiB RAM, $t=3$, $p=4$, 16B CSPRNG Salt | Protects user passwords against GPU/ASIC brute-force attacks |
+| **Key Wrapping & Deniability** | `SVKEY04` Dual-Slot Envelope (2 $\times$ 96B slots + `XChaCha20-Poly1305`) | Instant password rotation & Plausible Deniability (`index.meta` vs `index.shadow`) |
+| **Symmetric Chunk AEAD** | `XChaCha20-Poly1305` (256-bit DEK, 192-bit Nonce, 128-bit Tag) | Authenticated encryption per 4 MiB chunk |
+| **Stream Integrity** | Rogaway `STREAM` construction (64-bit Counter + EOF Flag in Nonce & AAD) | Prevents chunk reordering, truncation, and splice attacks |
+| **Content-Addressed Dedup** | `BLAKE3 Keyed Hash` (`BLAKE3_Keyed(DEK, PlainChunk)`) | Prevents cross-vault hash leakage while deduplicating identical 4 MiB blocks |
+| **Anti Bit-Rot ECC** | Systematic `Reed-Solomon GF(2^8)` ($8+4$ Cauchy shards + `SHA-256`) | Self-heals up to 33.3% damaged NAND flash sectors prior to `Poly1305` auth |
+| **RAM & Unplug Hygiene** | `ZeroizeOnDrop` + `libc::mlock` + 2s USB Hot-Plug Watchdog | Locks keys in physical RAM and zeroes DEK immediately if USB is unplugged |
 
 ---
 
 ## Threat Model
 
-### What SecureHUB Protects Against
-1. **Lost or Stolen USB Drive (At-Rest Confidentiality):**
-   * File contents, filenames, directory trees, and original file sizes are completely encrypted.
-   * Only obfuscated '<128-bit-hex>.bin' files exist on the physical `exFAT` partition.
-2. **Active Offline Tampering (At-Rest Integrity):**
-   * Modifying a single bit inside any '.bin' file or `index.meta` causes immediate `Poly1305` authentication failure prior to Zstd decompression (preventing decompression bomb exploits).
-   * Reordering two 4 MB chunks or truncating the end of a file is detected via the 64-bit chunk index and `FinalEOF` byte bound into both the Nonce and AAD.
-3. **Forensic Remnants on Host Disk during Media Playback:**
-   * Images, PDFs, and text files are decoded strictly in RAM.
-   * Large videos are streamed over loopback `127.0.0.1` with a random 128-bit per-session token using $O(1)$ chunk seeking, leaving zero temporary files in '/tmp' or '%TEMP%'.
+### 1. Lost or Stolen USB Drive (At-Rest Confidentiality)
+* All filenames, directory structures, file sizes, and chunk tables are encrypted inside `index.meta` / `index.shadow`.
+* Only obfuscated '<128-bit-hex>.bin' and '<256-bit-blake3-keyed>.chk' blobs exist on the `exFAT` partition.
+* Because `BLAKE3` deduplication uses the vault's secret 256-bit **DEK** as its key (`keyed_hash`), an attacker cannot perform known-file confirmation attacks by comparing chunk hashes against public datasets.
 
-### Out of Scope
-* **Compromised Host OS:** If the host computer is infected with a kernel keylogger or screen scraper while the vault is unlocked, the attacker can capture the password or read unlocked data.
-* **Traffic Analysis on Total Vault Size:** While individual file names and directory hierarchies are hidden inside `index.meta`, an observer inspecting the raw `exFAT` partition can see the number of '.bin' blobs and their compressed sizes.
+### 2. Coercion & Rubber-Hose Cryptanalysis (Plausible Deniability)
+* Every initialized vault always creates a 199-byte `vault.key` with **two 96-byte slots** and both `index.meta` and `index.shadow` (plus their '.ecc' sidecars).
+* Even if the user has never configured a Shadow Vault, **Slot 1** is filled with 96 bytes of CSPRNG noise and `index.shadow` is encrypted with a discarded ephemeral 256-bit key.
+* Under coercion, the user can disclose the **Primary Password** (unlocking Slot 0 and revealing innocuous decoy files), while there is no cryptographic distinguisher proving that Slot 1 holds a valid second key rather than random initialization bytes.
+* *Operational Note:* Plausible deniability holds against an adversary who inspects the USB drive at a single point in time. If an adversary captures forensic images of the USB drive *before* and *after* you modify files in the Shadow Vault, they could observe new '.bin'/'.chk' files or changes to `index.shadow`.
+
+### 3. Active Tampering, Decompression Bombs & NAND Bit-Rot
+* **Authenticate-Before-Decompress:** No byte is ever passed to the `Zstd` decompressor until `Poly1305` has verified the integrity of the encrypted chunk.
+* **Bit-Rot vs. Tampering:** If NAND flash degradation corrupts up to 4 out of 12 shards in `index.meta`, `index.shadow`, or `vault.key`, the `Reed-Solomon GF(2^8)` healer reconstructs the original ciphertext and verifies it with `Poly1305`.
 
 ---
 
 ## Reporting a Vulnerability
 
-Please **do not** open a public GitHub issue for suspected cryptographic or security vulnerabilities.
-Instead, use GitHub's [**Private Vulnerability Reporting**](https://github.com/kimiko88/SecureHUB/security/advisories/new) tab on this repository so we can coordinate a fix and release a patch prior to disclosure.
+Please **do not** open a public GitHub issue for suspected security vulnerabilities. Use GitHub's [**Private Vulnerability Reporting**](https://github.com/kimiko88/SecureHUB/security/advisories/new) tab so we can release a coordinated fix.

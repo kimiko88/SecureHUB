@@ -113,13 +113,38 @@ jobs:
           echo "C_INCLUDE_PATH=C:/winfsp_sdk/inc/fuse;C:/winfsp_sdk/inc" >> $GITHUB_ENV
           echo "CGO_CFLAGS=-IC:/winfsp_sdk/inc/fuse -IC:/winfsp_sdk/inc" >> $GITHUB_ENV
 
-      - name: Install macOS Dependencies (OSXFUSE / macFUSE C Headers)
+      - name: Install macOS Dependencies (FUSE headers only if needed)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/osxfuse/fuse.git /tmp/osxfuse_sdk
-          sudo mkdir -p /usr/local/include/fuse
-          sudo cp -vf /tmp/osxfuse_sdk/include/* /usr/local/include/fuse/
+          set -euxo pipefail
+
+          mkdir -p /tmp/osxfuse_sdk /usr/local/include/fuse
+
+          if [ ! -d /tmp/osxfuse_sdk/.git ]; then
+            git clone --depth 1 https://github.com/osxfuse/fuse.git /tmp/osxfuse_sdk || true
+          fi
+
+          if [ -d /tmp/osxfuse_sdk/include ]; then
+            for file in /tmp/osxfuse_sdk/include/*; do
+              [ -e "$file" ] || continue
+              base="$(basename "$file")"
+              if [ ! -e "/usr/local/include/fuse/$base" ]; then
+                cp -v "$file" "/usr/local/include/fuse/$base"
+              fi
+            done
+          fi
+
+          if [ -d /tmp/osxfuse_sdk/include/fuse ]; then
+            for file in /tmp/osxfuse_sdk/include/fuse/*; do
+              [ -e "$file" ] || continue
+              base="$(basename "$file")"
+              if [ ! -e "/usr/local/include/fuse/$base" ]; then
+                cp -v "$file" "/usr/local/include/fuse/$base"
+              fi
+            done
+          fi
+
           echo "CGO_ENABLED=1" >> $GITHUB_ENV
           echo "CPATH=/tmp/osxfuse_sdk/include:/usr/local/include/fuse" >> $GITHUB_ENV
           echo "C_INCLUDE_PATH=/tmp/osxfuse_sdk/include:/usr/local/include/fuse" >> $GITHUB_ENV

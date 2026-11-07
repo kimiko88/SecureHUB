@@ -66,9 +66,10 @@ func InitOrOpenVault(usbMountPath, password string, createNew bool) (*SecureVaul
 	}
 
 	v := &SecureVault{
-		rootPath: vaultDir,
-		encoder:  encoder,
-		decoder:  decoder,
+		rootPath:    vaultDir,
+		activeIndex: "index.meta",
+		encoder:     encoder,
+		decoder:     decoder,
 		chunkPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, ChunkSize)
@@ -96,7 +97,7 @@ func InitOrOpenVault(usbMountPath, password string, createNew bool) (*SecureVaul
 		if _, err := io.ReadFull(rand.Reader, v.dek); err != nil {
 			return nil, err
 		}
-		if err := v.wrapAndSaveDEK(password, v.salt); err != nil {
+		if err := v.initDualSlotKeyAndShadow(password); err != nil {
 			return nil, err
 		}
 
@@ -121,7 +122,7 @@ func InitOrOpenVault(usbMountPath, password string, createNew bool) (*SecureVaul
 	}
 
 	if _, err := os.Stat(keyFile); err == nil {
-		v.dek, err = v.unwrapDEK(password, v.salt)
+		v.dek, v.isShadow, v.activeIndex, err = v.unwrapDualOrLegacyDEK(password, v.salt)
 		if err != nil {
 			return nil, errors.New("password errata o vault.key manomesso")
 		}
@@ -293,6 +294,13 @@ func (v *SecureVault) Stats() VaultStats {
 			st.TotalChunks += len(entry.ChunkSizes)
 			st.OriginalSize += entry.OriginalSize
 			st.DiskSize += entry.DiskSize
+		}
+	}
+	st.IsShadowVault = v.isShadow
+	for _, refCount := range v.index.ChunkRefCounts {
+		if refCount > 1 {
+			st.DeduplicatedChunks += (refCount - 1)
+			st.SavedDedupBytes += int64(refCount-1) * ChunkSize
 		}
 	}
 	return st
@@ -681,7 +689,11 @@ func (v *SecureVault) saveIndexLocked() error {
 	if err != nil {
 		return err
 	}
-	indexFile := filepath.Join(v.rootPath, "index.meta")
+	indexName := v.activeIndex
+	if indexName == "" {
+		indexName = "index.meta"
+	}
+	indexFile := filepath.Join(v.rootPath, indexName)
 	tmpFile := indexFile + ".tmp"
 
 	f, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
@@ -694,14 +706,22 @@ func (v *SecureVault) saveIndexLocked() error {
 		_ = os.Remove(tmpFile)
 		return streamErr
 	}
-	return os.Rename(tmpFile, indexFile)
+	if err := os.Rename(tmpFile, indexFile); err != nil {
+		return err
+	}
+	return WriteECCSidecar(indexFile)
 }
 
 func (v *SecureVault) loadIndex() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	indexFile := filepath.Join(v.rootPath, "index.meta")
+	indexName := v.activeIndex
+	if indexName == "" {
+		indexName = "index.meta"
+	}
+	indexFile := filepath.Join(v.rootPath, indexName)
+	_, _, _ = VerifyAndHealWithECC(indexFile)
 	f, err := os.Open(indexFile)
 	if err != nil {
 		return err
@@ -712,7 +732,13 @@ func (v *SecureVault) loadIndex() error {
 	if err := v.decryptStreamParallel(f, &buf, 0, nil); err != nil {
 		return err
 	}
-	return json.Unmarshal(buf.Bytes(), &v.index)
+	if err := json.Unmarshal(buf.Bytes(), &v.index); err != nil {
+		return err
+	}
+	if v.index.ChunkRefCounts == nil {
+		v.index.ChunkRefCounts = make(map[string]int)
+	}
+	return nil
 }
 
 func normalizePath(p string) string {

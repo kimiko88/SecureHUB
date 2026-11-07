@@ -26,6 +26,8 @@ const (
 	ArgonThreads       = 4
 	VaultStreamMagic   = "SVAULT03"
 	VaultKeyMagic      = "SVKEY03"
+	VaultKeyDualMagic  = "SVKEY04" // Header 7B per Dual-Slot Plausible Deniability (199 byte totali)
+	DualSlotSize       = 96        // 16B Salt + 24B Nonce + 32B DEK + 16B Tag + 8B Pad
 )
 
 type ProgressFunc func(processedBytes, totalBytes int64)
@@ -37,11 +39,13 @@ type FileEntry struct {
 	OriginalSize int64     `json:"original_size"`
 	DiskSize     int64     `json:"disk_size"`
 	ChunkSizes   []uint32  `json:"chunk_sizes,omitempty"`
+	ChunkRefs    []string  `json:"chunk_refs,omitempty"` // Hash BLAKE3 per deduplicazione O(1)
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type VaultIndex struct {
-	Entries map[string]FileEntry `json:"entries"`
+	Entries        map[string]FileEntry `json:"entries"`
+	ChunkRefCounts map[string]int       `json:"chunk_ref_counts,omitempty"`
 }
 
 // ScrubReport contiene l'esito della verifica di integrità globale Poly1305
@@ -58,7 +62,10 @@ type VaultStats struct {
 	TotalFolders int
 	TotalChunks  int
 	OriginalSize int64
-	DiskSize     int64
+	DiskSize           int64
+	DeduplicatedChunks int
+	SavedDedupBytes    int64
+	IsShadowVault      bool
 }
 
 type SecureVault struct {
@@ -73,6 +80,8 @@ type SecureVault struct {
 	index          VaultIndex
 	streamListener net.Listener
 	streamToken    string
+	activeIndex    string // "index.meta" (Primario) oppure "index.shadow" (Nascosto)
+	isShadow       bool
 }
 
 func deriveKey(password string, salt []byte) []byte {

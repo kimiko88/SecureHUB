@@ -6,10 +6,12 @@ labels: bug
 assignees: ''
 ---
 
-## Implementation Affected
+## Implementation & Subsystem Affected
 - [ ] Go Edition (`/`)
 - [ ] Rust Edition (`/secureusb-rs`)
-- [ ] Both / Wire Protocol (`SVAULT03`)
+- [ ] Wire Protocol (`SVAULT03` / `SVKEY04` / `RSECC01`)
+- [ ] Plausible Deniability (`index.shadow`) / `BLAKE3` Deduplication / `Reed-Solomon` ECC
+- [ ] USB Auto-Detection / FUSE / WinFsp Mount
 
 ## Environment
 - **OS & Architecture:** (e.g., Windows 11 x64, Ubuntu 24.04 x64, macOS Sequoia ARM64)

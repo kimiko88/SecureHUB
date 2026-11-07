@@ -1,18 +1,19 @@
 <div align="center">
 
-# 🔐 SecureHUB (SVAULT03)
+# 🔐 SecureHUB (SVAULT03 / SVKEY04)
 
-**High-Performance Cross-Platform Encrypted & Compressed USB Virtual Filesystem**  
+**High-Performance Cross-Platform Encrypted, Deduplicated & Self-Healing USB Virtual Filesystem**  
 *Dual Implementation in **Go** (Fyne) & **Rust** (egui + Rayon + SIMD + Zeroize)*
 
 [![CI/CD Build & Test](https://github.com/kimiko88/SecureHUB/actions/workflows/release.yml/badge.svg)](https://github.com/kimiko88/SecureHUB/actions/workflows/release.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
 [![Rust Edition](https://img.shields.io/badge/Rust-2021%20(SIMD%20%2B%20LTO)-DEA584?logo=rust)](https://www.rust-lang.org/)
-[![Protocol](https://img.shields.io/badge/Vault%20Protocol-SVAULT03-6f42c1)](#svault03-wire-format)
+[![Protocol](https://img.shields.io/badge/Protocol-SVAULT03%20%7C%20SVKEY04-6f42c1)](#wire-formats--cryptographic-envelopes)
+[![ECC](https://img.shields.io/badge/Anti%20Bit--Rot-Reed--Solomon%20GF(256)-059669)](#wire-formats--cryptographic-envelopes)
+[![Dedup](https://img.shields.io/badge/Deduplication-BLAKE3%20Keyed-d97706)](#wire-formats--cryptographic-envelopes)
 [![License: MIT](https://img.shields.io/badge/License-MIT-success.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-informational)](#quick-start)
 
-[English](#-overview) • [Italiano](#-panoramica-italiano) • [Architecture](ARCHITECTURE.md) • [Security Policy](SECURITY.md) • [Contributing](CONTRIBUTING.md)
+[English](#-overview) • [Italiano](#-panoramica-italiano) • [Architecture](ARCHITECTURE.md) • [Security & Threat Model](SECURITY.md) • [Contributing](CONTRIBUTING.md) • [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -20,26 +21,28 @@
 
 ## 🚀 Overview
 
-**SecureHUB** transforms any standard USB flash drive or external SSD into a zero-trust, hardware-agnostic encrypted and compressed vault that works natively across **Windows, Linux, and macOS** without requiring kernel drivers for proprietary filesystems (such as LUKS, BitLocker, or APFS).
+**SecureHUB** turns any standard USB flash drive or external SSD into a zero-trust, self-healing, hardware-agnostic encrypted vault that runs natively across **Windows, Linux, and macOS** without requiring kernel drivers for proprietary filesystems (such as LUKS, BitLocker, or APFS).
 
-It combines a physical **exFAT** partition with the **SVAULT03** user-space cryptographic engine:
-* **State-of-the-Art AEAD Cryptography:** Key derivation via **Argon2id** (64 MB RAM, 3 iterations, 4 lanes) paired with **XChaCha20-Poly1305** (256-bit key, 192-bit extended nonce).
-* **High-Speed Zstandard Compression:** Compresses every 4 MB chunk with **Zstd** prior to encryption, achieving decompression speeds exceeding 1,000 MB/s.
-* **Multi-Core Parallel Pipeline:** Saturates all CPU cores ('runtime.NumCPU()' in Go / 'rayon' work-stealing in Rust) while preserving strict sequential chunk ordering.
-* **$O(1)$ Random-Access Video Streaming:** Implements 'io.ReadSeeker' / 'ReadAt' over 4 MB chunks and exposes a local loopback 'HTTP 206 Partial Content' ('Range') server. Jump to minute 90 of a 20 GB 4K movie instantaneously without extracting temporary files to disk.
-* **Native Virtual Disk Mount (FUSE / WinFsp):** Mount the encrypted vault as a native OS drive ('Z:' on Windows, '/mnt/secureusb' on Linux/macOS).
-* **Zero-Temp In-RAM Previewers:** Built-in text editor, image viewer ('PNG', 'JPEG', 'GIF'), and 'PDF' reader that decode streams directly in RAM.
+By pairing a physical **exFAT** partition with the **SVAULT03 / SVKEY04** cryptographic engine, it delivers:
+
+* **🕵️ Plausible Deniability (Dual-Slot Hidden Shadow Vault):** `vault.key` (`SVKEY04`, fixed 199 bytes) always contains two indistinguishable 96-byte key slots. Entering the *Primary Password* unlocks Slot 0 (`index.meta` with decoy files), while entering the *Secret Shadow Password* unlocks Slot 1 (`index.shadow`). Even when unconfigured, Slot 1 and `index.shadow` are populated with CSPRNG noise, making it mathematically impossible to prove a second vault exists.
+* **🧬 Content-Addressed Deduplication (`BLAKE3` Keyed Hash):** Computes `CID = BLAKE3_Keyed(DEK, PlainChunk_4MB)` prior to compression and encryption. Identical 4 MB chunks across duplicate files or VM snapshots are stored on disk **only once** ($O(1)$ skip) and tracked via encrypted reference counts.
+* **🛡️ Self-Healing Anti Bit-Rot (`Reed-Solomon GF(2^8)`):** Protects critical metadata (`index.meta`, `index.shadow`, `vault.key`) with '.ecc' sidecar files (`RSECC01`: 8 data shards + 4 Cauchy parity shards + per-shard SHA-256). Automatically repairs up to **33.3% corrupted NAND sectors** via Gaussian elimination in $\text{GF}(2^8)$ before `Poly1305` verification.
+* **🔑 Instant Password Change (Key Wrapping) & Global `Poly1305` Scrubbing:** Re-wraps the 256-bit Master Data Encryption Key (**DEK**) in milliseconds without re-encrypting gigabytes of data, and verifies 100% of disk blocks across all CPU cores on demand.
+* **⚡ Entropy-Adaptive `Zstd` (4 MB Window) + Multi-Core `XChaCha20-Poly1305`:** Samples Shannon entropy on the first 16 KB of each chunk to dynamically switch between high compression (Level 6 with 4 MB LZ77 window) and fast bypass (Level 1) for already-compressed media.
+* **🎬 $O(1)$ Random-Access Video Streaming & Zero-Temp RAM Viewers:** Built-in text editor, image viewer (`PNG/JPEG/GIF`), `PDF` reader in RAM, loopback `HTTP 206 Partial Content` (`Range`) streaming server, and native **FUSE / macFUSE / WinFsp** virtual drive mounting.
+* **🔌 Automatic USB Hot-Plug Detection & Emergency Panic Lock:** Automatically detects inserted USB drives, highlights active vaults, supports **Drag & Drop** of files/folders (automatically filtering OS junk like '.DS_Store' and 'Thumbs.db'), and **immediately zeroes the DEK in RAM** if the USB drive is physically unplugged.
 
 ---
 
 ## 🇮🇹 Panoramica (Italiano)
 
-**SecureHUB** consente di formattare qualsiasi chiavetta USB in **exFAT** (per la massima compatibilità nativa con Windows, Linux e macOS) e di gestirvi all'interno un **Virtual Filesystem (VFS) cifrato e compresso** basato sul protocollo **SVAULT03**:
+**SecureHUB** permette di formattare qualsiasi chiavetta USB in **exFAT** e di gestirvi all'interno un **Virtual Filesystem (VFS) cifrato, deduplicato e auto-riparante** compatibile nativamente con **Windows, Linux e macOS**:
 
-1. **Zero Dipendenze dal File System Ospite:** I nomi dei file e la gerarchia delle cartelle sono cifrati dentro 'index.meta'; su disco compaiono solo blocchi offuscati '<UUID>.bin'.
-2. **Streaming a Blocchi da 4 MB a RAM Costante:** Importa ed esporta file di decine di gigabyte mantenendo un'impronta di memoria costante.
-3. **Riproduzione Video Istantanea ($O(1)$ Seek):** Grazie alla tabella 'ChunkSizes', il lettore multimediale decifra al volo solo il singolo blocco da 4 MB corrispondente al minuto selezionato.
-4. **Doppia Implementazione Interoperabile (Go & Rust):** I due motori condividono lo stesso identico formato binario su disco ('SVAULT03').
+1. **Plausible Deniability (Doppio Vault Nascosto):** Inserendo la *Password Primaria* si apre `index.meta`; inserendo la *Password Segreta* si apre il volume fantasma `index.shadow`.
+2. **Deduplicazione Content-Addressed (`BLAKE3`):** I blocchi da 4 MB identici vengono individuati tramite `BLAKE3_Keyed(DEK, chunk)` e salvati sulla chiavetta una sola volta.
+3. **Auto-Riparazione Bit-Rot (`Reed-Solomon GF(2^8)`):** I file '.ecc' riparano automaticamente in RAM e su disco fino a 4 shard corrotti su 12 prima della verifica crittografica `Poly1305`.
+4. **Rilevamento Automatico USB, Panic Lock e Drag & Drop:** Individua in automatico le chiavette inserite, blocca il Vault azzerando la RAM se la chiavetta viene estratta fisicamente e filtra automaticamente i file spazzatura ('.DS_Store', 'Thumbs.db', 'desktop.ini', '*.tmp') durante l'importazione di file e cartelle.
 
 ---
 
@@ -47,101 +50,101 @@ It combines a physical **exFAT** partition with the **SVAULT03** user-space cryp
 
 ```mermaid
 flowchart TB
-    subgraph Physical["Physical USB Layer (Windows / Linux / macOS)"]
-        EXFAT["exFAT Partition (No 4GB file limit)"]
-        SALT[".secure_vault/vault.salt (16B CSPRNG)"]
-        INDEX[".secure_vault/index.meta (Zstd + XChaCha20-Poly1305)"]
-        BLOBS[".secure_vault/blocks/<UUID>.bin (SVAULT03 Chunks)"]
-        EXFAT --> SALT & INDEX & BLOBS
+    subgraph Physical["Physical USB Layer (exFAT — Windows / Linux / macOS)"]
+        KEY["vault.key + vault.key.ecc (SVKEY04 Dual-Slot 199B)"]
+        IDX1["index.meta + index.meta.ecc (Primary Vault Index)"]
+        IDX2["index.shadow + index.shadow.ecc (Hidden Shadow Index)"]
+        BLOBS[".secure_vault/blocks/<UUID>.bin & <BLAKE3_CID>.chk"]
     end
 
-    subgraph Engine["SVAULT03 Cryptographic & Compression Engine (Go / Rust)"]
-        KDF["Argon2id KDF (64 MB, t=3, p=4) + Zeroize/mlock"]
-        POOL["Multi-Core Worker Pool (Goroutines / Rayon + SIMD)"]
-        SEEKER["O(1) Random-Access Seeker (4 MB Chunk Offset Table)"]
-        SALT --> KDF
-        KDF --> POOL & SEEKER
-        BLOBS <--> POOL & SEEKER
+    subgraph Engine["SVAULT03 / SVKEY04 Cryptographic Engine (Go & Rust)"]
+        ECC["Reed-Solomon GF(2^8) Healer (8 Data + 4 Parity Shards)"]
+        KDF["Argon2id KDF (64 MB, t=3, p=4) + DEK Unwrapping + Zeroize/mlock"]
+        DEDUP["BLAKE3 Keyed Deduplicator + Adaptive Zstd (4MB Window)"]
+        POOL["Multi-Core AEAD Pipeline (Goroutines / Rayon + SIMD In-Place)"]
+        SEEKER["O(1) Random-Access Seeker + Poly1305 Global Scrubber"]
+        KEY & IDX1 & IDX2 --> ECC --> KDF
+        KDF --> DEDUP & POOL & SEEKER
+        DEDUP --> POOL --> BLOBS
+        BLOBS --> SEEKER
     end
 
-    subgraph Interfaces["User Interfaces & OS Integration"]
-        GUI["Native Cross-Platform GUI (Fyne v2 / egui)"]
+    subgraph UX["Cyber-Dark GUI & OS Integration"]
+        HOTPLUG["USB Auto-Discovery + Unplug Panic Lock Watchdog"]
+        SEARCH["Instant RAM Search + Breadcrumbs + Async Spinners"]
         RAMVIEW["Zero-Temp RAM Viewer (Text, PNG/JPG/GIF, PDF)"]
-        HTTP["Loopback HTTP 206 Range Server (127.0.0.1)"]
-        FUSE["Native Virtual Drive (FUSE / macFUSE / WinFsp)"]
+        STREAM["Loopback HTTP 206 Range Server + FUSE / WinFsp Drive"]
     end
 
-    Engine <--> GUI & RAMVIEW & HTTP & FUSE
+    Engine <--> HOTPLUG & SEARCH & RAMVIEW & STREAM
 ```
 
 ---
 
-## 🧬 SVAULT03 Wire Format
+## 🧬 Wire Formats & Cryptographic Envelopes
 
-Every file stored inside '.secure_vault/blocks/<UUID>.bin' follows the **STREAM** chunked AEAD construction to prevent chunk reordering, splice attacks, and premature truncation:
+### 1. `SVKEY04` Dual-Slot Key Envelope (`vault.key` — 199 Bytes)
+Provides **Instant Key-Wrapped Password Changes** and **Plausible Deniability**:
 
 ```text
-+--------------------+-------------------+--------------------------------------------------+
-|   Magic Header     |     Stream ID     |               Sequence of Chunks                 |
-|  "SVAULT03" (8 B)  |  CSPRNG (15 B)    |           Chunk 0, Chunk 1, ... Chunk N          |
-+--------------------+-------------------+--------------------------------------------------+
-                                         |
-         +-------------------------------+-------------------------------+
-         v                                                               v
-+--------------------+-----------------------------------+-------------------------------+
-|  CipherLen (4 B)   |     Ciphertext (Variable)         |      Poly1305 Tag (16 B)      |
-|   uint32 LE        |  XChaCha20(Zstd(PlainChunk ≤4MB)) | Authenticates AAD + Ciphertext|
-+--------------------+-----------------------------------+-------------------------------+
++-------------------+------------------------------------+------------------------------------+
+|   Magic Header    |        Slot 0 (Primary Vault)      |   Slot 1 (Shadow Vault / CSPRNG)   |
+|  "SVKEY04" (7 B)  |  Salt(16B)+Nonce(24B)+DEK_Tag(48B) |  Salt(16B)+Nonce(24B)+DEK_Tag(48B) |
+|                   |           + RandomPad(8B) = 96 B   |           + RandomPad(8B) = 96 B   |
++-------------------+------------------------------------+------------------------------------+
 ```
 
-* **Per-Chunk 24-Byte Nonce:** `StreamID (15B) || ChunkIndex_BE64 (8B) || FinalEOF_Flag (1B: 0x00 or 0x01)`
-* **Per-Chunk 17-Byte AAD:** `"SVAULT03" (8B) || ChunkIndex_BE64 (8B) || FinalEOF_Flag (1B)`
+### 2. `RSECC01` Reed-Solomon Sidecar (`*.ecc`)
+Protects against NAND flash bit-rot using a systematic $12 \times 8$ Cauchy matrix over $\text{GF}(2^8)$:
+
+```text
++-------------------+------------------+------------------+--------------------+------------------------+
+|   Magic Header    |   OriginalSize   |    ShardSize     |  12 Shard Hashes   |   4 Parity Shards      |
+| "RSECC01\0" (8 B) |    uint64 LE     |    uint32 LE     | 12 * SHA256 (384B) | 4 * ShardSize (GF(256))|
++-------------------+------------------+------------------+--------------------+------------------------+
+```
+
+### 3. `SVAULT03` Stream Blocks (`<UUID>.bin`) & Deduplicated Chunks (`<CID>.chk`)
+* **Stream Blobs (`.bin`):** '[Magic "SVAULT03" (8B)] + [StreamID (15B)] + Chunk_0 + ... + Chunk_N', where each 4 MB chunk binds `ChunkIndex_BE64` and `FinalEOF_Byte` into both the 24-byte `XChaCha20` Nonce and 17-byte `Poly1305` AAD.
+* **Deduplicated Chunks (`.chk`):** Addressed by `CID = Hex(BLAKE3_Keyed(DEK, PlainChunk))` with packet layout '[Nonce (24B)] + [XChaCha20-Poly1305(Zstd(PlainChunk), AAD = BLAKE3_Raw32B)]'.
 
 ---
 
 ## ⚡ Go vs. Rust Implementation Matrix
 
-Both engines live in this repository and are 100% binary-compatible on disk:
+Both engines live side-by-side in this repository and are 100% binary-compatible on disk:
 
-| Feature / Subsystem | Go Implementation (`/`) | Rust Implementation (`/secureusb-rs`) |
+| Subsystem | Go Edition (`/`) | Rust Edition (`/secureusb-rs`) |
 | :--- | :--- | :--- |
-| **GUI Framework** | `Fyne v2` (OpenGL / GLFW) | `eframe / egui` (Immediate-mode native) |
-| **Parallelism** | Channel-of-Channels FIFO + Goroutines | `rayon` Work-Stealing + Batch ParIter |
-| **AEAD Memory Model** | Pooled `sync.Pool` 4 MB Buffers | **In-Place Zero-Copy** (`AeadInPlace`) |
-| **Hardware Acceleration** | Go ASM (`x/crypto` & `klauspost/zstd`) | Explicit **AVX2 / BMI2 / NEON** (`.cargo/config.toml`) |
-| **RAM Key Protection** | Scoped Heap Memory | `ZeroizeOnDrop` + OS Page Locking (`libc::mlock`) |
-| **Fuzzing & Benchmarks** | `testing.F` + `testing.B` | `proptest` + `cargo-fuzz` (libFuzzer) + `Criterion` |
+| **GUI Framework & Theme** | `Fyne v2` (`SecureCyberTheme` Dark Slate/Emerald) | `eframe / egui` (Cyber-Dark + Async `mpsc` Spinners) |
+| **Multi-Core Pipeline** | Channel-of-Channels FIFO + Goroutines | `rayon` Work-Stealing + **In-Place AEAD** (`AeadInPlace`) |
+| **SIMD Acceleration** | Go ASM (`x/crypto` & `klauspost/zstd`) | Explicit **AVX2 / BMI2 / NEON** (`.cargo/config.toml`) |
+| **RAM Key Hygiene** | Explicit DEK/KEK Zeroing + Unplug Watchdog | `ZeroizeOnDrop` + `libc::mlock` + Unplug Watchdog |
+| **BLAKE3 Deduplication** | Zero-Dependency Native RFC `BLAKE3` Keyed Engine | `blake3` Crate with SIMD Assembly |
+| **Reed-Solomon $\text{GF}(2^8)$** | Native Cauchy Matrix + Gauss-Jordan Inverter | Native Cauchy Matrix + `sha2` Shard Verification |
 
 ---
 
 ## 🛠️ Quick Start
 
-### Option A: Build & Run the Rust Edition (Recommended for Maximum Throughput)
-
+### 1. Build & Run the Rust Edition
 ```bash
 cd secureusb-rs
 
 # Run GUI in optimized release mode (SIMD + Fat LTO enabled)
 cargo run --release
 
-# Run Unit, Integration, E2E, and Property-Fuzz tests
+# Run all Unit, Integration, E2E, Proptest, and v0.4.0 Architectural Tests
 cargo test --release
-
-# Run statistical Criterion benchmarks
-cargo bench
 ```
 
-### Option B: Build & Run the Go Edition
-
+### 2. Build & Run the Go Edition
 ```bash
-# Synchronize dependencies (requires C compiler for Fyne/CGO)
+# Synchronize dependencies
 go mod tidy
 
-# Run Unit, Integration, and E2E tests with Race Detector
+# Run all Unit, Integration, E2E, and v0.4.0 Architectural Tests (Shadow, Dedup, ECC)
 go test -v -race ./internal/vault/...
-
-# Run native Go Fuzzing
-go test -fuzz=FuzzVaultRoundTripAndSeeker -fuzztime=15s ./internal/vault
 
 # Build standalone executable
 go build -ldflags="-s -w" -o secureusb .
@@ -151,21 +154,21 @@ go build -ldflags="-s -w" -o secureusb .
 
 ## 🧪 Testing & Verification Suite
 
-| Test Layer | Go Command | Rust Command | Verified Invariants |
+| Test Suite | Go Command | Rust Command | Verified Capabilities |
 | :--- | :--- | :--- | :--- |
-| **Unit Tests** | `go test ./internal/vault -run Unit` | `cargo test --lib` | Nonce/AAD uniqueness, path normalization, key derivation |
-| **Integration** | `go test ./internal/vault -run Integration` | `cargo test --test integration_e2e_fuzz` | Multi-core chunking, Poly1305 bit-flip & EOF truncation detection |
-| **End-to-End (E2E)** | `go test ./internal/vault -run E2E` | `cargo test test_full_lifecycle` | Full lifecycle, cross-chunk `Seek`, `HTTP 206 Partial Content` |
-| **Fuzzing** | `go test -fuzz=FuzzVaultRoundTripAndSeeker` | `cargo +nightly fuzz run fuzz_seeker` | Arbitrary payload lengths, boundary seeks, random `ReadAt` |
+| **v0.4.0 Architecture** | `go test -v -run TestV4 ./internal/vault` | `cargo test --test v4_features_test` | Dual-Vault Plausible Deniability, `BLAKE3` Dedup, `Reed-Solomon` Bit-Rot Healing |
+| **Integration & Folders** | `go test -v -run Integration ./internal/vault` | `cargo test --test integration_e2e_fuzz` | Multi-core chunking, recursive `ImportDir/ExportDir`, OS junk filter |
+| **End-to-End (E2E)** | `go test -v -run E2E ./internal/vault` | `cargo test test_full_lifecycle` | Full lifecycle, $O(1)$ cross-chunk `Seek`, `HTTP 206 Range` streaming |
+| **Fuzzing & Benchmarks** | `go test -fuzz=FuzzVaultRoundTripAndSeeker` | `cargo bench` | Mutation fuzzing on arbitrary offsets & throughput in MB/s |
 
 ---
 
 ## 📄 Documentation
 
-* [**ARCHITECTURE.md**](ARCHITECTURE.md) — Deep dive into the `SVAULT03` protocol, $O(1)$ seeker math, and concurrency pipeline.
-* [**SECURITY.md**](SECURITY.md) — Threat model, cryptographic parameters, and vulnerability reporting.
-* [**CONTRIBUTING.md**](CONTRIBUTING.md) — Development setup, coding standards, and pull request workflow.
-* [**CHANGELOG.md**](CHANGELOG.md) — Release history and protocol evolution.
+* [**ARCHITECTURE.md**](ARCHITECTURE.md) — Mathematical & engineering specification of `SVAULT03`, `SVKEY04`, `BLAKE3` dedup, and `Reed-Solomon GF(2^8)`.
+* [**SECURITY.md**](SECURITY.md) — Threat model, Plausible Deniability guarantees, and vulnerability disclosure policy.
+* [**CONTRIBUTING.md**](CONTRIBUTING.md) — Developer workflow and cross-language compatibility rules.
+* [**CHANGELOG.md**](CHANGELOG.md) — Complete version history up to `v0.4.0`.
 
 ---
 

@@ -1,4 +1,6 @@
 pub mod crypto_parallel;
+pub mod dedup_deniability;
+pub mod ecc_rs;
 pub mod seeker;
 pub mod types;
 
@@ -20,6 +22,8 @@ pub struct SecureVault {
     cipher: XChaCha20Poly1305,
     index: RwLock<VaultIndex>,
     stream_port: RwLock<Option<(u16, String)>>,
+    active_index: String,
+    is_shadow: bool,
 }
 
 impl SecureVault {
@@ -43,7 +47,7 @@ impl SecureVault {
             fs::write(&salt_file, salt)?;
 
             let dek = MasterKey::generate_random();
-            Self::wrap_and_save_dek(&key_file, password, &salt, dek.as_bytes())?;
+            dedup_deniability::init_dual_slot_and_shadow(&vault_dir, password, &salt, dek.as_bytes())?;
             let cipher = XChaCha20Poly1305::new(dek.as_bytes().into());
 
             let vault = Arc::new(Self {
@@ -52,6 +56,8 @@ impl SecureVault {
                 cipher,
                 index: RwLock::new(VaultIndex::default()),
                 stream_port: RwLock::new(None),
+                active_index: "index.meta".to_string(),
+                is_shadow: false,
             });
             vault.save_index()?;
             return Ok(vault);
@@ -72,10 +78,10 @@ impl SecureVault {
             ));
         }
 
-        let dek = if key_file.exists() {
-            Self::unwrap_dek(&key_file, password, &salt)?
+        let (dek, is_shadow, active_index) = if key_file.exists() {
+            dedup_deniability::unwrap_dual_or_legacy(&vault_dir, password, &salt)?
         } else {
-            MasterKey::derive_from_password(password, &salt)?
+            (MasterKey::derive_from_password(password, &salt)?, false, "index.meta".to_string())
         };
         let cipher = XChaCha20Poly1305::new(dek.as_bytes().into());
 
@@ -85,6 +91,8 @@ impl SecureVault {
             cipher,
             index: RwLock::new(VaultIndex::default()),
             stream_port: RwLock::new(None),
+            active_index,
+            is_shadow,
         });
         vault.load_index()?;
 
@@ -181,16 +189,7 @@ impl SecureVault {
                 "La nuova password deve contenere almeno 6 caratteri",
             ));
         }
-
-        let salt_file = self.root_path.join("vault.salt");
-        let key_file = self.root_path.join("vault.key");
-        let cur_salt = fs::read(&salt_file)?;
-        let _ = Self::unwrap_dek(&key_file, old_password, &cur_salt)?;
-
-        let mut new_salt = [0u8; SALT_SIZE];
-        rand::thread_rng().fill_bytes(&mut new_salt);
-        Self::wrap_and_save_dek(&key_file, new_password, &new_salt, self.master_key.as_bytes())?;
-        fs::write(&salt_file, new_salt)
+        self.change_dual_or_legacy_password(old_password, new_password)
     }
 
     /// Ricerca istantanea in RAM su tutti i file e le sottocartelle del Vault
@@ -318,7 +317,10 @@ impl SecureVault {
                     is_dir: false,
                     original_size: plain_size,
                     disk_size,
+                    deduplicated_chunks: 0,
+                    is_shadow_vault: self.is_shadow,
                     chunk_sizes,
+                    chunk_refs: Vec::new(),
                     updated_at: Utc::now(),
                 },
             );
@@ -538,7 +540,10 @@ impl SecureVault {
                 is_dir: true,
                 original_size: 0,
                 disk_size: 0,
+                deduplicated_chunks: 0,
+                is_shadow_vault: self.is_shadow,
                 chunk_sizes: Vec::new(),
+                chunk_refs: Vec::new(),
                 updated_at: Utc::now(),
             });
         }
@@ -566,7 +571,10 @@ impl SecureVault {
                     is_dir: true,
                     original_size: 0,
                     disk_size: 0,
+                    deduplicated_chunks: 0,
+                    is_shadow_vault: self.is_shadow,
                     chunk_sizes: Vec::new(),
+                    chunk_refs: Vec::new(),
                     updated_at: Utc::now(),
                 },
             );
@@ -635,7 +643,7 @@ impl SecureVault {
             let idx = self.index.read().unwrap();
             serde_json::to_vec(&*idx)?
         };
-        let index_file = self.root_path.join("index.meta");
+        let index_file = self.root_path.join(&self.active_index);
         let tmp_file = self.root_path.join("index.meta.tmp");
 
         let f = OpenOptions::new()
@@ -644,11 +652,13 @@ impl SecureVault {
             .truncate(true)
             .open(&tmp_file)?;
         crypto_parallel::encrypt_stream_parallel(&self.cipher, Cursor::new(raw_json), f, 6)?;
-        fs::rename(tmp_file, index_file)
+        fs::rename(&tmp_file, &index_file)?;
+        ecc_rs::write_ecc_sidecar(&index_file)
     }
 
     fn load_index(&self) -> io::Result<()> {
-        let index_file = self.root_path.join("index.meta");
+        let index_file = self.root_path.join(&self.active_index);
+        let _ = ecc_rs::verify_and_heal_with_ecc(&index_file);
         let f = File::open(index_file)?;
         let mut plain_json = Vec::new();
         crypto_parallel::decrypt_stream_parallel(&self.cipher, f, &mut plain_json)?;

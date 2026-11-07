@@ -7,7 +7,7 @@ assignees: ''
 ---
 
 ## Problem Statement
-Describe the use case or limitation you are experiencing.
+Describe the use case or cryptographic/UX improvement you would like to see.
 
 ## Proposed Solution
-Describe how the feature should work across the Go/Rust engines or UI.
+Describe how the feature should work across both the Go and Rust engines.

@@ -160,7 +160,12 @@ func showUnlockScreen(w fyne.Window) {
 			dialog.ShowError(errors.New("seleziona la chiavetta USB e inserisci la password"), w)
 			return
 		}
-		v, err := vault.InitOrOpenVault(path, pass, false)
+		var v *vault.SecureVault
+		err := runWithBusySpinner(w, "Sblocco Vault in Corso...", "Derivazione Argon2id + Verifica Reed-Solomon ECC...", func() error {
+			var openErr error
+			v, openErr = vault.InitOrOpenVault(path, pass, false)
+			return openErr
+		})
 		if err != nil {
 			dialog.ShowError(err, w)
 			return
@@ -183,7 +188,12 @@ func showUnlockScreen(w fyne.Window) {
 				if !ok {
 					return
 				}
-				v, err := vault.InitOrOpenVault(path, pass, true)
+				var v *vault.SecureVault
+				err := runWithBusySpinner(w, "Inizializzazione SVAULT03...", "Generazione Dual-Slot Key, Shadow Index e Parità Reed-Solomon...", func() error {
+					var initErr error
+					v, initErr = vault.InitOrOpenVault(path, pass, true)
+					return initErr
+				})
 				if err != nil {
 					dialog.ShowError(err, w)
 					return
@@ -901,7 +911,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			importBtn, importDirBtn,
 			streamPlayBtn, fuseBtn, openExtBtn,
 			exportBtn, exportDirBtn,
-			scrubBtn, changePassBtn, deleteBtn, lockBtn,
+			scrubBtn, changePassBtn, shadowVaultBtn(w, v), dedupImportBtn(w, v, &currentDir, refreshList), deleteBtn, lockBtn,
 		)),
 		container.NewGridWithColumns(2, container.NewHScroll(breadcrumbBox), searchEntry),
 		widget.NewSeparator(),
@@ -1033,6 +1043,95 @@ func formatBytes(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+
+// runWithBusySpinner mostra un indicatore di caricamento animato mentre l'operazione procede in background.
+func runWithBusySpinner(w fyne.Window, title, subtitle string, work func() error) error {
+	spinner := widget.NewActivity()
+	spinner.Start()
+	defer spinner.Stop()
+
+	msgLabel := widget.NewLabel(subtitle)
+	box := container.NewVBox(
+		container.NewCenter(spinner),
+		msgLabel,
+	)
+	modal := dialog.NewCustomWithoutButtons(title, container.NewPadded(box), w)
+	modal.Show()
+	defer modal.Hide()
+
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- work()
+	}()
+	return <-doneCh
+}
+
+func shadowVaultBtn(w fyne.Window, v *vault.SecureVault) *widget.Button {
+	return widget.NewButtonWithIcon("Shadow Vault", theme.VisibilityOffIcon(), func() {
+		pass1 := widget.NewPasswordEntry()
+		pass2 := widget.NewPasswordEntry()
+		dialog.ShowForm("🕵️ Plausible Deniability — Configura Secondo Vault Nascosto", "Attiva Shadow Vault", "Annulla", []*widget.FormItem{
+			widget.NewFormItem("Password Segreta Shadow", pass1),
+			widget.NewFormItem("Conferma Password Segreta", pass2),
+		}, func(ok bool) {
+			if !ok {
+				return
+			}
+			if pass1.Text != pass2.Text {
+				dialog.ShowError(errors.New("le due password non coincidono"), w)
+				return
+			}
+			err := runWithBusySpinner(w, "Configurazione Shadow Vault...", "Cifratura Slot 1 (Argon2id) + generazione parità Reed-Solomon...", func() error {
+				return v.ConfigureShadowVault(pass1.Text)
+			})
+			if err != nil {
+				dialog.ShowError(err, w)
+			} else {
+				dialog.ShowInformation("Shadow Vault Attivo",
+					"Il secondo Vault Nascosto (index.shadow) è pronto!\nAlla prossima apertura inserisci la Password Segreta per accedere al volume fantasma.", w)
+			}
+		}, w)
+	})
+}
+
+func dedupImportBtn(w fyne.Window, v *vault.SecureVault, currentDir *string, refreshList func()) *widget.Button {
+	return widget.NewButtonWithIcon("Importa Dedup (BLAKE3)", theme.ContentCopyIcon(), func() {
+		fd := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+			if err != nil || reader == nil {
+				return
+			}
+			filePath := reader.URI().Path()
+			fileName := reader.URI().Name()
+			_ = reader.Close()
+
+			info, _ := os.Stat(filePath)
+			inFile, openErr := os.Open(filePath)
+			if openErr != nil {
+				dialog.ShowError(openErr, w)
+				return
+			}
+
+			var hits int
+			target := filepath.Join(*currentDir, fileName)
+			wErr := runWithBusySpinner(w, "Deduplicazione Content-Addressed BLAKE3...",
+				fmt.Sprintf("Calcolo hash BLAKE3 per chunk da 4 MB su %s...", fileName), func() error {
+					defer inFile.Close()
+					var dErr error
+					hits, dErr = v.WriteStreamDedup(target, inFile, info.Size(), nil)
+					return dErr
+				})
+			if wErr != nil {
+				dialog.ShowError(wErr, w)
+				return
+			}
+			refreshList()
+			dialog.ShowInformation("Importazione Deduplicata Completata",
+				fmt.Sprintf("File %q importato!\nChunk da 4 MB già presenti e riutilizzati senza riscrittura (BLAKE3 Hit): %d", fileName, hits), w)
+		}, w)
+		fd.Show()
+	})
 }
 
 var _ = storage.NewFileURI

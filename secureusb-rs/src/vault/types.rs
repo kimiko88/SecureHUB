@@ -17,6 +17,8 @@ pub const MAX_COMPRESSED_CHUNK: usize = CHUNK_SIZE + (CHUNK_SIZE / 8) + 65536;
 pub const MAX_TEXT_PREVIEW_SIZE: u64 = 16 * 1024 * 1024;
 pub const VAULT_STREAM_MAGIC: &[u8; 8] = b"SVAULT03";
 pub const VAULT_KEY_MAGIC: &[u8; 7] = b"SVKEY03";
+pub const VAULT_KEY_DUAL_MAGIC: &[u8; 7] = b"SVKEY04";
+pub const DUAL_SLOT_SIZE: usize = 96;
 
 pub fn should_ignore_entry(name_or_path: impl AsRef<Path>) -> bool {
     let Some(os_name) = name_or_path.as_ref().file_name() else {
@@ -113,14 +115,20 @@ pub struct FileEntry {
     pub is_dir: bool,
     pub original_size: u64,
     pub disk_size: u64,
+    pub deduplicated_chunks: usize,
+    pub is_shadow_vault: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chunk_sizes: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunk_refs: Vec<String>,
     pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VaultIndex {
     pub entries: HashMap<String, FileEntry>,
+    #[serde(default)]
+    pub chunk_ref_counts: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default)]

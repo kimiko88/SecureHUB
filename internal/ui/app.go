@@ -341,6 +341,34 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		fd.Show()
 	})
 
+	importDirBtn := widget.NewButtonWithIcon("Importa Cartella", theme.FolderOpenIcon(), func() {
+		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
+			if err != nil || uri == nil {
+				return
+			}
+			folderPath := uri.Path()
+			prog := dialog.NewProgress("Importazione Cartella Multi-Core",
+				fmt.Sprintf("Cifratura ricorsiva di %s...", filepath.Base(folderPath)), w)
+			prog.Show()
+
+			go func() {
+				count, impErr := v.ImportDir(folderPath, currentDir, func(done, total int64) {
+					if total > 0 {
+						prog.SetValue(float64(done) / float64(total))
+					}
+				})
+				prog.Hide()
+				if impErr != nil {
+					dialog.ShowError(impErr, w)
+					return
+				}
+				dialog.ShowInformation("Cartella Importata",
+					fmt.Sprintf("Importati e cifrati %d file con successo!", count), w)
+				refreshList()
+			}()
+		}, w)
+	})
+
 	streamPlayBtn := widget.NewButtonWithIcon("Stream Video al Volo", theme.MediaPlayIcon(), func() {
 		if selectedEntry == nil || selectedEntry.IsDir {
 			dialog.ShowInformation("Info", "Seleziona prima un video o un file multimediale dalla lista.", w)
@@ -454,6 +482,39 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		fs.Show()
 	})
 
+	exportDirBtn := widget.NewButtonWithIcon("Esporta Cartella", theme.DownloadIcon(), func() {
+		// Se è selezionata una cartella esporta quella, altrimenti esporta la directory corrente
+		targetVirtualDir := currentDir
+		if selectedEntry != nil && selectedEntry.IsDir {
+			targetVirtualDir = selectedEntry.VirtualPath
+		}
+
+		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
+			if err != nil || uri == nil {
+				return
+			}
+			destParent := uri.Path()
+			prog := dialog.NewProgress("Esportazione Cartella Multi-Core",
+				fmt.Sprintf("Decifratura ricorsiva di %s...", targetVirtualDir), w)
+			prog.Show()
+
+			go func() {
+				count, expErr := v.ExportDir(targetVirtualDir, destParent, func(done, total int64) {
+					if total > 0 {
+						prog.SetValue(float64(done) / float64(total))
+					}
+				})
+				prog.Hide()
+				if expErr != nil {
+					dialog.ShowError(expErr, w)
+					return
+				}
+				dialog.ShowInformation("Cartella Esportata",
+					fmt.Sprintf("Esportati e verificati %d file in %s!", count, destParent), w)
+			}()
+		}, w)
+	})
+
 	saveBtn := widget.NewButtonWithIcon("Salva Testo", theme.DocumentSaveIcon(), func() {
 		if selectedEntry == nil || selectedEntry.IsDir || editor.Disabled() {
 			return
@@ -493,7 +554,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	})
 
 	topBar := container.NewVBox(
-		container.NewHBox(upBtn, newFolderBtn, newFileBtn, importBtn, streamPlayBtn, fuseBtn, openExtBtn, exportBtn, deleteBtn, lockBtn),
+		container.NewHBox(upBtn, newFolderBtn, newFileBtn, importBtn, importDirBtn, streamPlayBtn, fuseBtn, openExtBtn, exportBtn, exportDirBtn, deleteBtn, lockBtn),
 		container.NewBorder(nil, nil, pathLabel, nil, widget.NewLabel("")),
 		widget.NewSeparator(),
 	)

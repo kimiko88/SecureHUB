@@ -23,6 +23,136 @@ pub struct SecureVault {
 }
 
 impl SecureVault {
+    /// Importa ricorsivamente un'intera cartella dal PC dentro `target_parent_virtual_dir`
+    pub fn import_dir(
+        &self,
+        local_dir_path: impl AsRef<Path>,
+        target_parent_virtual_dir: &str,
+    ) -> io::Result<usize> {
+        let local_root = local_dir_path.as_ref();
+        if !local_root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Il percorso selezionato non è una cartella",
+            ));
+        }
+
+        let folder_name = local_root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Imported_Folder".to_string());
+
+        let root_virtual = normalize_path(&format!("{target_parent_virtual_dir}/{folder_name}"));
+        let _ = self.create_dir(&root_virtual);
+
+        let mut imported_files = 0usize;
+        self.import_dir_recursive(local_root, local_root, &root_virtual, &mut imported_files)?;
+        self.save_index()?;
+        Ok(imported_files)
+    }
+
+    fn import_dir_recursive(
+        &self,
+        base_local: &Path,
+        current_local: &Path,
+        root_virtual: &str,
+        imported_files: &mut usize,
+    ) -> io::Result<()> {
+        for entry_res in fs::read_dir(current_local)? {
+            let entry = entry_res?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+
+            let rel = path
+                .strip_prefix(base_local)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let rel_slash = rel.to_string_lossy().replace('\\', "/");
+            let target_virtual = normalize_path(&format!("{root_virtual}/{rel_slash}"));
+
+            if file_type.is_dir() {
+                let _ = self.create_dir(&target_virtual);
+                self.import_dir_recursive(base_local, &path, root_virtual, imported_files)?;
+            } else if file_type.is_file() {
+                let f = File::open(&path)?;
+                self.write_stream(&target_virtual, f)?;
+                *imported_files += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Esporta ricorsivamente una cartella virtuale dal Vault verso `local_dest_parent` sul PC
+    pub fn export_dir(
+        &self,
+        virtual_dir_path: &str,
+        local_dest_parent: impl AsRef<Path>,
+    ) -> io::Result<usize> {
+        let vdir = normalize_path(virtual_dir_path);
+        let folder_name = if vdir == "/" {
+            "Vault_Export".to_string()
+        } else {
+            Path::new(&vdir)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Vault_Export".to_string())
+        };
+
+        let target_root_local = local_dest_parent.as_ref().join(folder_name);
+        fs::create_dir_all(&target_root_local)?;
+
+        let prefix = if vdir == "/" {
+            "/".to_string()
+        } else {
+            format!("{vdir}/")
+        };
+
+        let items: Vec<FileEntry> = {
+            let idx = self.index.read().unwrap();
+            idx.entries
+                .values()
+                .filter(|e| e.virtual_path == vdir || e.virtual_path.starts_with(&prefix))
+                .cloned()
+                .collect()
+        };
+
+        // 1. Ricrea tutte le sottocartelle
+        for item in &items {
+            if !item.is_dir {
+                continue;
+            }
+            let rel = item
+                .virtual_path
+                .strip_prefix(&vdir)
+                .unwrap_or(&item.virtual_path)
+                .trim_start_matches('/');
+            if !rel.is_empty() {
+                fs::create_dir_all(target_root_local.join(rel))?;
+            }
+        }
+
+        // 2. Decifra e decomprime tutti i file appartenenti al sotto-albero
+        let mut exported_files = 0usize;
+        for item in &items {
+            if item.is_dir {
+                continue;
+            }
+            let rel = item
+                .virtual_path
+                .strip_prefix(&vdir)
+                .unwrap_or(&item.virtual_path)
+                .trim_start_matches('/');
+            let dest_file_path = target_root_local.join(rel);
+            if let Some(parent) = dest_file_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let out_file = File::create(&dest_file_path)?;
+            self.read_stream(&item.virtual_path, BufWriter::with_capacity(1024 * 1024, out_file))?;
+            exported_files += 1;
+        }
+
+        Ok(exported_files)
+    }
+    
     pub fn init_or_open(
         usb_mount_path: impl AsRef<Path>,
         password: &str,

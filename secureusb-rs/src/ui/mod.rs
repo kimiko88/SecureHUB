@@ -236,6 +236,20 @@ impl eframe::App for SecureUsbApp {
                     }
                 }
 
+                if ui.button("📁📥 Importa Cartella").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        if let Some(v) = self.vault.clone() {
+                            match v.import_dir(&folder, &self.current_dir) {
+                                Ok(count) => {
+                                    self.status_msg = format!("Importati {count} file dalla cartella!");
+                                    self.refresh_dir();
+                                }
+                                Err(e) => self.status_msg = format!("Errore import cartella: {e}"),
+                            }
+                        }
+                    }
+                }
+
                 if ui.button("▶ Stream Video al Volo (O(1) Seek)").clicked() {
                     if let (Some(v), Some(sel)) = (&self.vault, &self.selected_path) {
                         if let Ok(url) = v.get_stream_url(sel) {
@@ -249,6 +263,23 @@ impl eframe::App for SecureUsbApp {
                         if let Some(dest) = rfd::FileDialog::new().save_file() {
                             if let Ok(out) = File::create(dest) {
                                 let _ = v.read_stream(sel, BufWriter::new(out));
+                            }
+                        }
+                    }
+                }
+
+                                if ui.button("📁📤 Esporta Cartella").clicked() {
+                    if let Some(dest_folder) = rfd::FileDialog::new().pick_folder() {
+                        if let Some(v) = self.vault.clone() {
+                            match v.export_dir(&self.current_dir, &dest_folder) {
+                                Ok(count) => {
+                                    self.status_msg = format!(
+                                        "Esportati {count} file da '{}' in '{}'!",
+                                        self.current_dir,
+                                        dest_folder.display()
+                                    );
+                                }
+                                Err(e) => self.status_msg = format!("Errore export cartella: {e}"),
                             }
                         }
                     }

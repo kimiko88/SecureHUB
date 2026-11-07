@@ -1,0 +1,6 @@
+# Abilita le istruzioni SIMD hardware per ChaCha20-Poly1305 e Zstd
+[target.'cfg(all(target_arch = "x86_64", not(target_os = "macos")))']
+rustflags = ["-C", "target-feature=+avx2,+bmi2,+sse4.1,+pclmulqdq"]
+
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["-C", "target-feature=+neon"]

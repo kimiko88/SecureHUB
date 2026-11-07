@@ -2,10 +2,10 @@ name: SecureUSB CI/CD — Build & Test (Go + Rust)
 
 on:
   push:
-    branches: [ "main", "master" ]
-    tags: [ "v*" ]
+    branches: ["main", "master"]
+    tags: ["v*"]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
 
 permissions:
   contents: write
@@ -113,15 +113,17 @@ jobs:
           echo "C_INCLUDE_PATH=C:/winfsp_sdk/inc/fuse;C:/winfsp_sdk/inc" >> $GITHUB_ENV
           echo "CGO_CFLAGS=-IC:/winfsp_sdk/inc/fuse -IC:/winfsp_sdk/inc" >> $GITHUB_ENV
 
-      - name: Install macOS Dependencies (FUSE Headers)
+      - name: Install macOS Dependencies (OSXFUSE / macFUSE C Headers)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/winfsp/winfsp.git /tmp/winfsp_sdk
+          git clone --depth 1 https://github.com/osxfuse/fuse.git /tmp/osxfuse_sdk
+          sudo mkdir -p /usr/local/include/fuse
+          sudo cp -vf /tmp/osxfuse_sdk/include/* /usr/local/include/fuse/
           echo "CGO_ENABLED=1" >> $GITHUB_ENV
-          echo "CPATH=/tmp/winfsp_sdk/inc/fuse:/tmp/winfsp_sdk/inc" >> $GITHUB_ENV
-          echo "C_INCLUDE_PATH=/tmp/winfsp_sdk/inc/fuse:/tmp/winfsp_sdk/inc" >> $GITHUB_ENV
-          echo "CGO_CFLAGS=-I/tmp/winfsp_sdk/inc/fuse -I/tmp/winfsp_sdk/inc -D_FILE_OFFSET_BITS=64" >> $GITHUB_ENV
+          echo "CPATH=/tmp/osxfuse_sdk/include:/usr/local/include/fuse" >> $GITHUB_ENV
+          echo "C_INCLUDE_PATH=/tmp/osxfuse_sdk/include:/usr/local/include/fuse" >> $GITHUB_ENV
+          echo "CGO_CFLAGS=-I/tmp/osxfuse_sdk/include -I/usr/local/include/fuse -D_FILE_OFFSET_BITS=64" >> $GITHUB_ENV
 
       - name: Build Go Executable (${{ matrix.os_name }})
         shell: bash

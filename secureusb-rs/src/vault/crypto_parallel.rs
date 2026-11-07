@@ -79,13 +79,14 @@ pub fn encrypt_stream_parallel<R: Read, W: Write>(
 
                 // Alloca un unico buffer contiguo: [len: 4B] + [payload compresso/cifrato] + [tag: 16B]
                 let mut packet = vec![0u8; 4 + max_comp];
-                let comp_size = zstd::bulk::compress_to_buffer(
-                    &job.plain_data,
-                    &mut packet[4..],
-                    zstd_level,
-                )
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let mut compressor = zstd::bulk::Compressor::new(zstd_level)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let _ = compressor.window_log(22); // 2^22 = 4 MB esatti per singolo chunk
+                let _ = compressor.long_distance_matching(true);
 
+                let comp_size = compressor
+                    .compress_to_buffer(&job.plain_data, &mut packet[4..])
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                 packet.truncate(4 + comp_size);
 
                 let (nonce, aad) =

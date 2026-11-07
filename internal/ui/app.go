@@ -146,19 +146,32 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 
 	var listWidget *widget.List
 
+	searchEntry := widget.NewEntry()
+	searchEntry.SetPlaceHolder("🔍 Cerca istantaneamente in tutto il Vault (in RAM)...")
+
 	refreshList := func() {
-		entries = v.ListDir(currentDir)
+		q := strings.TrimSpace(searchEntry.Text)
+		if q == "" {
+			entries = v.ListDir(currentDir)
+			pathLabel.SetText("Percorso: " + currentDir + "  —  [Drag & Drop attivo]")
+		} else {
+			entries = v.Search(q)
+			pathLabel.SetText(fmt.Sprintf("Risultati ricerca in RAM per %q (%d trovati)", q, len(entries)))
+		}
 		selectedEntry = nil
 		editor.SetText("")
 		editor.Disable()
 		previewHolder.Objects = []fyne.CanvasObject{editor}
 		previewHolder.Refresh()
-		pathLabel.SetText("Percorso: " + currentDir + "  —  [Drag & Drop attivo: rilascia file o cartelle qui]")
-		infoLabel.SetText(fmt.Sprintf("%d elementi nella cartella corrente", len(entries)))
+		infoLabel.SetText(fmt.Sprintf("%d elementi visualizzati", len(entries)))
 		if listWidget != nil {
 			listWidget.UnselectAll()
 			listWidget.Refresh()
 		}
+	}
+
+	searchEntry.OnChanged = func(_ string) {
+		refreshList()
 	}
 
 	// Gestione nativa Drag & Drop di file e cartelle dal sistema operativo dentro la finestra Fyne
@@ -628,15 +641,56 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		showUnlockScreen(w)
 	})
 
+	changePwdBtn := widget.NewButtonWithIcon("Password", theme.AccountIcon(), func() {
+		oldPass := widget.NewPasswordEntry()
+		newPass := widget.NewPasswordEntry()
+		dialog.ShowForm("Cambio Password Istantaneo (Key Wrapping)", "Aggiorna KEK", "Annulla", []*widget.FormItem{
+			widget.NewFormItem("Password Attuale", oldPass),
+			widget.NewFormItem("Nuova Password", newPass),
+		}, func(ok bool) {
+			if !ok {
+				return
+			}
+			if err := v.ChangePassword(oldPass.Text, newPass.Text); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			dialog.ShowInformation("Password Aggiornata",
+				"La Master Key (DEK) è stata ricifrata istantaneamente con la nuova password senza riscrivere i blocchi dati!", w)
+		}, w)
+	})
+
+	scrubBtn := widget.NewButtonWithIcon("Verifica Integrità", theme.ConfirmIcon(), func() {
+		prog := dialog.NewProgress("Scrubbing Crittografico Poly1305 Multi-Core",
+			"Verifica dei tag AEAD su tutti i blocchi della chiavetta...", w)
+		prog.Show()
+		go func() {
+			rep, _ := v.VerifyIntegrity(func(done, total int64) {
+				if total > 0 {
+					prog.SetValue(float64(done) / float64(total))
+				}
+			})
+			prog.Hide()
+			if len(rep.CorruptedFiles) == 0 {
+				dialog.ShowInformation("Integrità Certificata (100%)",
+					fmt.Sprintf("Verificati %d file (%d chunk da 4 MB, %s).\nNessun bit-rot o manomissione rilevata!",
+						rep.FilesChecked, rep.ChunksVerified, formatBytes(rep.BytesVerified)), w)
+			} else {
+				dialog.ShowError(fmt.Errorf("rilevati %d file corrotti:\n%s",
+					len(rep.CorruptedFiles), strings.Join(rep.CorruptedFiles, "\n")), w)
+			}
+		}()
+	})
+
 	topBar := container.NewVBox(
 		container.NewHBox(
 			upBtn, newFolderBtn, newFileBtn,
 			importBtn, importDirBtn,
 			streamPlayBtn, fuseBtn, openExtBtn,
 			exportBtn, exportDirBtn,
-			deleteBtn, lockBtn,
+			scrubBtn, changePwdBtn, deleteBtn, lockBtn,
 		),
-		container.NewBorder(nil, nil, pathLabel, nil, widget.NewLabel("")),
+		container.NewBorder(nil, nil, pathLabel, nil, searchEntry),
 		widget.NewSeparator(),
 	)
 

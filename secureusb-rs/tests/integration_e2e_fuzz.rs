@@ -192,7 +192,58 @@ fn test_full_lifecycle_seeker_and_http_range_e2e() {
 }
 
 // ============================================================================
-// 4. PROPERTY & FUZZ TESTING (Proptest: Round-Trip + Random-Access ReadAt)
+// 4. INTEGRATION TEST: Cambio Password Istantaneo (Key Wrapping) & Scrubbing Integrità
+// ============================================================================
+
+#[test]
+fn test_change_password_and_verify_integrity_scrubbing() {
+    let dir = tempdir().unwrap();
+    let pass_a = "InitialPassword123!";
+    let pass_b = "NewSecretPassword456!";
+
+    let vault = SecureVault::init_or_open(dir.path(), pass_a, true).unwrap();
+    let test_data = b"Dati crittografati con DEK a 256 bit".repeat(500);
+    vault.write_file("/docs/segreto.txt", &test_data).unwrap();
+
+    // 1. Verifica integrità iniziale
+    let rep = vault.verify_integrity();
+    assert_eq!(rep.files_checked, 1);
+    assert_eq!(rep.chunks_verified, 1);
+    assert!(rep.corrupted_files.is_empty());
+
+    // 2. Cambio password con password vecchia errata deve fallire
+    assert!(vault.change_password("WrongPassword!", pass_b).is_err());
+
+    // 3. Cambio password valido (Key Wrapping istantaneo)
+    vault.change_password(pass_a, pass_b).unwrap();
+    drop(vault);
+
+    // 4. Riapertura con vecchia password deve fallire
+    assert!(SecureVault::init_or_open(dir.path(), pass_a, false).is_err());
+
+    // 5. Riapertura con nuova password deve avere successo e leggere i dati intatti
+    let vault_reopened = SecureVault::init_or_open(dir.path(), pass_b, false).unwrap();
+    let read_back = vault_reopened.read_file("/docs/segreto.txt").unwrap();
+    assert_eq!(read_back, test_data);
+
+    // 6. Test manomissione e rilevamento scrubbing
+    let stat = vault_reopened.stat("/docs/segreto.txt").unwrap();
+    let blob_path = dir
+        .path()
+        .join(".secure_vault")
+        .join("blocks")
+        .join(&stat.blob_id);
+    let mut raw_bytes = fs::read(&blob_path).unwrap();
+    raw_bytes[HEADER_SIZE + 20] ^= 0xFF; // corruzione bit-flip nel ciphertext
+    fs::write(&blob_path, &raw_bytes).unwrap();
+
+    let rep_corrupted = vault_reopened.verify_integrity();
+    assert_eq!(rep_corrupted.corrupted_files.len(), 1);
+    assert!(rep_corrupted.corrupted_files[0].contains("/docs/segreto.txt"));
+}
+
+// ============================================================================
+// 5. PROPERTY & FUZZ TESTING (Proptest: Round-Trip + Random-Access ReadAt)
 // ============================================================================
 
 proptest! {

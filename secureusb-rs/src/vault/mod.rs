@@ -2,7 +2,7 @@ pub mod crypto_parallel;
 pub mod seeker;
 pub mod types;
 
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+use chacha20poly1305::{KeyInit, Tag, XChaCha20Poly1305};
 use chrono::Utc;
 use rand::RngCore;
 use std::fs::{self, File, OpenOptions};
@@ -13,16 +13,90 @@ use std::sync::{Arc, RwLock};
 pub use seeker::VaultReadSeeker;
 pub use types::*;
 
+use chacha20poly1305::aead::{Aead, AeadInPlace, Payload};
+use chacha20poly1305::XNonce;
+use rayon::prelude::*;
+
 pub struct SecureVault {
     root_path: PathBuf,
-    #[allow(dead_code)]
-    master_key: MasterKey,
+    master_key: MasterKey, // DEK a 256-bit ancorata in RAM con mlock + ZeroizeOnDrop
+    salt: RwLock<[u8; SALT_SIZE]>,
     cipher: XChaCha20Poly1305,
     index: RwLock<VaultIndex>,
     stream_port: RwLock<Option<(u16, String)>>,
 }
 
+fn wrap_dek(kek: &MasterKey, dek: &MasterKey) -> io::Result<Vec<u8>> {
+    let kek_cipher = XChaCha20Poly1305::new(kek.as_bytes().into());
+    let mut nonce = [0u8; NONCE_SIZE];
+    rand::thread_rng().fill_bytes(&mut nonce);
+
+    let ct = kek_cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: dek.as_bytes(),
+                aad: KEY_WRAP_AAD,
+            },
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Errore Key Wrapping"))?;
+
+    let mut out = Vec::with_capacity(NONCE_SIZE + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+fn unwrap_dek(kek: &MasterKey, packet: &[u8]) -> io::Result<MasterKey> {
+    if packet.len() != NONCE_SIZE + KEY_SIZE + TAG_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "File vault.key corrotto",
+        ));
+    }
+    let kek_cipher = XChaCha20Poly1305::new(kek.as_bytes().into());
+    let mut plain = kek_cipher
+        .decrypt(
+            XNonce::from_slice(&packet[..NONCE_SIZE]),
+            Payload {
+                msg: &packet[NONCE_SIZE..],
+                aad: KEY_WRAP_AAD,
+            },
+        )
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Password errata o vault.key manomesso",
+            )
+        })?;
+
+    let mut raw = [0u8; KEY_SIZE];
+    raw.copy_from_slice(&plain);
+    zeroize::Zeroize::zeroize(&mut plain);
+    Ok(MasterKey::from_raw(raw))
+}
+
 impl SecureVault {
+    pub fn search(&self, query: &str) -> Vec<FileEntry> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let idx = self.index.read().unwrap();
+        let mut results: Vec<FileEntry> = idx
+            .entries
+            .values()
+            .filter(|e| e.virtual_path != "/" && e.virtual_path.to_lowercase().contains(&q))
+            .cloned()
+            .collect();
+
+        results.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.virtual_path.to_lowercase().cmp(&b.virtual_path.to_lowercase()),
+        });
+        results
+    }
     pub fn init_or_open(
         usb_mount_path: impl AsRef<Path>,
         password: &str,
@@ -32,6 +106,7 @@ impl SecureVault {
         let blocks_dir = vault_dir.join("blocks");
         let salt_file = vault_dir.join("vault.salt");
         let index_file = vault_dir.join("index.meta");
+        let key_file = vault_dir.join("vault.key");
 
         if create_new {
             let _ = fs::remove_dir_all(&vault_dir);
@@ -41,12 +116,16 @@ impl SecureVault {
             rand::thread_rng().fill_bytes(&mut salt);
             fs::write(&salt_file, salt)?;
 
-            let master_key = MasterKey::derive_from_password(password, &salt)?;
-            let cipher = XChaCha20Poly1305::new(master_key.as_bytes().into());
+            let kek = MasterKey::derive_from_password(password, &salt)?;
+            let dek = MasterKey::generate_random();
+            let wrapped = wrap_dek(&kek, &dek)?;
+            fs::write(&key_file, wrapped)?;
 
+            let cipher = XChaCha20Poly1305::new(dek.as_bytes().into());
             let vault = Arc::new(Self {
                 root_path: vault_dir,
-                master_key,
+                master_key: dek,
+                salt: RwLock::new(salt),
                 cipher,
                 index: RwLock::new(VaultIndex::default()),
                 stream_port: RwLock::new(None),
@@ -62,26 +141,208 @@ impl SecureVault {
             ));
         }
 
-        let salt = fs::read(&salt_file)?;
-        if salt.len() != SALT_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "File salt corrotto o illeggibile",
-            ));
+        let salt_vec = fs::read(&salt_file)?;
+        if salt_vec.len() != SALT_SIZE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "File salt corrotto"));
         }
+        let mut salt = [0u8; SALT_SIZE];
+        salt.copy_from_slice(&salt_vec);
 
-        let master_key = MasterKey::derive_from_password(password, &salt)?;
-        let cipher = XChaCha20Poly1305::new(master_key.as_bytes().into());
+        let kek = MasterKey::derive_from_password(password, &salt)?;
+        let (dek, needs_migration) = if key_file.exists() {
+            let pkt = fs::read(&key_file)?;
+            (unwrap_dek(&kek, &pkt)?, false)
+        } else {
+            (MasterKey::from_raw(*kek.as_bytes()), true)
+        };
 
+        let cipher = XChaCha20Poly1305::new(dek.as_bytes().into());
         let vault = Arc::new(Self {
             root_path: vault_dir,
-            master_key,
+            master_key: dek,
+            salt: RwLock::new(salt),
             cipher,
             index: RwLock::new(VaultIndex::default()),
             stream_port: RwLock::new(None),
         });
         vault.load_index()?;
+
+        if needs_migration {
+            if let Ok(wrapped) = wrap_dek(&kek, &vault.master_key) {
+                let _ = fs::write(&key_file, wrapped);
+            }
+        }
         Ok(vault)
+    }
+
+    pub fn change_password(&self, old_password: &str, new_password: &str) -> io::Result<()> {
+        if new_password.len() < 6 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "La nuova password deve contenere almeno 6 caratteri",
+            ));
+        }
+
+        let mut salt_guard = self.salt.write().unwrap();
+        let old_kek = MasterKey::derive_from_password(old_password, &*salt_guard)?;
+
+        let key_file = self.root_path.join("vault.key");
+        if key_file.exists() {
+            let wrapped_bytes = fs::read(&key_file)?;
+            let unwrapped_dek = unwrap_dek(&old_kek, &wrapped_bytes)?;
+            if unwrapped_dek.as_bytes() != self.master_key.as_bytes() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "La password attuale inserita non è corretta",
+                ));
+            }
+        } else if old_kek.as_bytes() != self.master_key.as_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "La password attuale inserita non è corretta",
+            ));
+        }
+
+        let mut new_salt = [0u8; SALT_SIZE];
+        rand::thread_rng().fill_bytes(&mut new_salt);
+
+        let new_kek = MasterKey::derive_from_password(new_password, &new_salt)?;
+        let new_wrapped = wrap_dek(&new_kek, &self.master_key)?;
+
+        let salt_file = self.root_path.join("vault.salt");
+        let key_tmp = self.root_path.join("vault.key.tmp");
+        let salt_tmp = self.root_path.join("vault.salt.tmp");
+
+        fs::write(&key_tmp, &new_wrapped)?;
+        if let Err(e) = fs::write(&salt_tmp, &new_salt) {
+            let _ = fs::remove_file(&key_tmp);
+            return Err(e);
+        }
+
+        if fs::rename(&key_tmp, &key_file).is_err() {
+            let _ = fs::remove_file(&key_file);
+            fs::rename(&key_tmp, &key_file)?;
+        }
+
+        if fs::rename(&salt_tmp, &salt_file).is_err() {
+            let _ = fs::remove_file(&salt_file);
+            fs::rename(&salt_tmp, &salt_file)?;
+        }
+
+        *salt_guard = new_salt;
+        Ok(())
+    }
+
+    pub fn verify_integrity(&self) -> IntegrityReport {
+        let files: Vec<FileEntry> = {
+            let idx = self.index.read().unwrap();
+            idx.entries
+                .values()
+                .filter(|e| !e.is_dir)
+                .cloned()
+                .collect()
+        };
+
+        let files_checked = files.len();
+
+        let results: Vec<(Option<String>, usize, u64)> = files
+            .into_par_iter()
+            .map(|entry| match self.verify_single_file_poly1305(&entry) {
+                Ok(chunks) => (None, chunks, entry.disk_size),
+                Err(err) => (
+                    Some(format!("{} ({})", entry.virtual_path, err)),
+                    0,
+                    0,
+                ),
+            })
+            .collect();
+
+        let mut report = IntegrityReport {
+            files_checked,
+            chunks_verified: 0,
+            bytes_verified: 0,
+            corrupted_files: Vec::new(),
+        };
+
+        for (corrupted, chunks, bytes) in results {
+            if let Some(err_msg) = corrupted {
+                report.corrupted_files.push(err_msg);
+            } else {
+                report.chunks_verified += chunks;
+                report.bytes_verified += bytes;
+            }
+        }
+        report.corrupted_files.sort();
+        report
+    }
+
+    fn verify_single_file_poly1305(&self, entry: &FileEntry) -> io::Result<usize> {
+        if entry.blob_id.is_empty() {
+            return Ok(0);
+        }
+        let blob_path = self.root_path.join("blocks").join(&entry.blob_id);
+        let mut file = File::open(&blob_path)
+            .map_err(|e| io::Error::new(e.kind(), "Blocco mancante su disco"))?;
+
+        let mut header = [0u8; HEADER_SIZE];
+        file.read_exact(&mut header)
+            .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "Header troncato"))?;
+
+        if &header[..8] != VAULT_STREAM_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Magic SVAULT03 non valido",
+            ));
+        }
+
+        let mut stream_id = [0u8; STREAM_ID_SIZE];
+        stream_id.copy_from_slice(&header[8..HEADER_SIZE]);
+
+        let mut len_buf = [0u8; 4];
+        let mut cipher_buf = Vec::new();
+
+        for (idx, &expected_len) in entry.chunk_sizes.iter().enumerate() {
+            file.read_exact(&mut len_buf)
+                .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, format!("Chunk {idx} mancante")))?;
+
+            let got_len = u32::from_le_bytes(len_buf);
+            if got_len != expected_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Lunghezza chunk {idx} alterata"),
+                ));
+            }
+
+            let got_len_usize = got_len as usize;
+            if got_len_usize < TAG_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Chunk {idx} troppo corto"),
+                ));
+            }
+
+            cipher_buf.resize(got_len_usize, 0);
+            file.read_exact(&mut cipher_buf)
+                .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, format!("Chunk {idx} troncato")))?;
+
+            let is_final = idx + 1 == entry.chunk_sizes.len();
+            let (nonce, aad) = build_chunk_nonce_and_aad(&stream_id, idx as u64, is_final);
+
+            let tag_pos = got_len_usize - TAG_SIZE;
+            let (ct_slice, tag_slice) = cipher_buf.split_at_mut(tag_pos);
+            let tag = Tag::from_slice(tag_slice);
+
+            self.cipher
+                .decrypt_in_place_detached(XNonce::from_slice(&nonce), &aad, ct_slice, tag)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("Tag Poly1305 invalido al chunk {idx}"),
+                    )
+                })?;
+        }
+
+        Ok(entry.chunk_sizes.len())
     }
 
     pub fn write_stream<R: Read>(&self, virtual_path: &str, src: R) -> io::Result<()> {

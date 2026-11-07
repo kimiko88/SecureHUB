@@ -16,7 +16,15 @@ pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB
 pub const MAX_COMPRESSED_CHUNK: usize = CHUNK_SIZE + (CHUNK_SIZE / 8) + 65536;
 pub const MAX_TEXT_PREVIEW_SIZE: u64 = 16 * 1024 * 1024;
 pub const VAULT_STREAM_MAGIC: &[u8; 8] = b"SVAULT03";
+pub const KEY_WRAP_AAD: &[u8] = b"SVAULT03-KEYWRAP";
 
+#[derive(Debug, Clone, Default)]
+pub struct IntegrityReport {
+    pub files_checked: usize,
+    pub chunks_verified: usize,
+    pub bytes_verified: u64,
+    pub corrupted_files: Vec<String>,
+}
 /// Restituisce true se il nome o percorso corrisponde a un file temporaneo o di sistema da escludere.
 pub fn should_ignore_entry(name_or_path: impl AsRef<Path>) -> bool {
     let Some(os_name) = name_or_path.as_ref().file_name() else {
@@ -60,6 +68,20 @@ pub struct MasterKey {
 }
 
 impl MasterKey {
+    pub fn generate_random() -> Self {
+        let mut key = MasterKey {
+            bytes: [0u8; KEY_SIZE],
+        };
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key.bytes);
+        key.lock_memory();
+        key
+    }
+
+    pub fn from_raw(raw: [u8; KEY_SIZE]) -> Self {
+        let key = MasterKey { bytes: raw };
+        key.lock_memory();
+        key
+    }
     pub fn derive_from_password(password: &str, salt: &[u8]) -> io::Result<Self> {
         let params = Params::new(64 * 1024, 3, 4, Some(KEY_SIZE))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;

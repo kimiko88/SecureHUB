@@ -57,6 +57,10 @@ struct SecureUsbApp {
     selected_is_dir: bool,
     preview: PreviewState,
     new_item_name: String,
+    search_query: String,
+    show_pwd_modal: bool,
+    old_pwd_input: String,
+    new_pwd_input: String,
 }
 
 impl SecureUsbApp {
@@ -65,7 +69,11 @@ impl SecureUsbApp {
             if self.current_dir.is_empty() {
                 self.current_dir = "/".to_string();
             }
-            self.entries = v.list_dir(&self.current_dir);
+            if self.search_query.trim().is_empty() {
+                self.entries = v.list_dir(&self.current_dir);
+            } else {
+                self.entries = v.search(&self.search_query);
+            }
         }
     }
 
@@ -198,6 +206,39 @@ impl eframe::App for SecureUsbApp {
                 });
         }
 
+        if self.show_pwd_modal {
+            egui::Window::new("🔑 Cambio Password Istantaneo (Key Wrapping)")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Password Attuale:");
+                    ui.add(egui::TextEdit::singleline(&mut self.old_pwd_input).password(true));
+                    ui.label("Nuova Password:");
+                    ui.add(egui::TextEdit::singleline(&mut self.new_pwd_input).password(true));
+                    ui.horizontal(|ui| {
+                        if ui.button("Aggiorna KEK").clicked() {
+                            if let Some(v) = &self.vault {
+                                match v.change_password(&self.old_pwd_input, &self.new_pwd_input) {
+                                    Ok(()) => {
+                                        self.status_msg =
+                                            "Password aggiornata istantaneamente tramite Key Wrapping!".to_string();
+                                        self.old_pwd_input.clear();
+                                        self.new_pwd_input.clear();
+                                        self.show_pwd_modal = false;
+                                    }
+                                    Err(e) => self.status_msg = format!("Errore cambio password: {e}"),
+                                }
+                            }
+                        }
+                        if ui.button("Annulla").clicked() {
+                            self.old_pwd_input.clear();
+                            self.new_pwd_input.clear();
+                            self.show_pwd_modal = false;
+                        }
+                    });
+                });
+        }
+
         if self.vault.is_none() {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading("Sblocco e Gestione Chiavetta Cifrata (Rust SVAULT03 — Drag & Drop Attivo)");
@@ -307,6 +348,27 @@ impl eframe::App for SecureUsbApp {
                         }
                     }
                 }
+                if ui.button("🛡 Verifica Integrità").clicked() {
+                    if let Some(v) = self.vault.clone() {
+                        let rep = v.verify_integrity();
+                        if rep.corrupted_files.is_empty() {
+                            self.status_msg = format!(
+                                "Integrità 100%: {} file ({} chunk, {} B) verificati con Poly1305!",
+                                rep.files_checked, rep.chunks_verified, rep.bytes_verified
+                            );
+                        } else {
+                            self.status_msg = format!(
+                                "ERRORE INTEGRITÀ ({} corrotti): {}",
+                                rep.corrupted_files.len(),
+                                rep.corrupted_files.join(", ")
+                            );
+                        }
+                    }
+                }
+
+                if ui.button("🔑 Cambia Password").clicked() {
+                    self.show_pwd_modal = true;
+                }
 
                 if ui.button("📁📥 Importa Cartella").clicked() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
@@ -376,6 +438,21 @@ impl eframe::App for SecureUsbApp {
                     self.vault = None;
                     self.entries.clear();
                     self.preview = PreviewState::None;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("🔍 Ricerca RAM:");
+                if ui.text_edit_singleline(&mut self.search_query).changed() {
+                    self.refresh_dir();
+                }
+                if !self.search_query.is_empty() && ui.button("✖").clicked() {
+                    self.search_query.clear();
+                    self.refresh_dir();
+                }
+                ui.separator();
+                ui.label(format!("Percorso: {}", self.current_dir));
+                if !self.status_msg.is_empty() {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, &self.status_msg);
                 }
             });
             ui.horizontal(|ui| {

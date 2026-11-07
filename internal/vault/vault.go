@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -47,13 +48,121 @@ func ShouldIgnoreFile(nameOrPath string) bool {
 	return false
 }
 
+// func InitOrOpenVault(usbMountPath, password string, createNew bool) (*SecureVault, error) {
+// 	vaultDir := filepath.Join(usbMountPath, ".secure_vault")
+// 	blocksDir := filepath.Join(vaultDir, "blocks")
+// 	saltFile := filepath.Join(vaultDir, "vault.salt")
+// 	indexFile := filepath.Join(vaultDir, "index.meta")
+
+// 	encoder, err := zstd.NewWriter(nil,
+// 		zstd.WithEncoderLevel(zstd.SpeedBetterCompression), // Livello ottimale (alta compressione, zero impatto in lettura)
+// 		zstd.WithWindowSize(ChunkSize),                     // Finestra di ricerca allineata all'intero chunk da 4 MB
+// 		zstd.WithEncoderConcurrency(1),                     // Concorrenza già gestita dai worker sui chunk
+// 	)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	decoder, err := zstd.NewReader(nil)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	v := &SecureVault{
+// 		rootPath: vaultDir,
+// 		encoder:  encoder,
+// 		decoder:  decoder,
+// 		chunkPool: sync.Pool{
+// 			New: func() any {
+// 				buf := make([]byte, ChunkSize)
+// 				return &buf
+// 			},
+// 		},
+// 		index: VaultIndex{Entries: make(map[string]FileEntry)},
+// 	}
+
+// 	if createNew {
+// 		_ = os.RemoveAll(vaultDir)
+// 		if err := os.MkdirAll(blocksDir, 0700); err != nil {
+// 			return nil, fmt.Errorf("impossibile creare le cartelle sulla USB: %w", err)
+// 		}
+
+// 		v.salt = make([]byte, SaltSize)
+// 		if _, err := io.ReadFull(rand.Reader, v.salt); err != nil {
+// 			return nil, err
+// 		}
+// 		if err := os.WriteFile(saltFile, v.salt, 0600); err != nil {
+// 			return nil, err
+// 		}
+
+// 		key := deriveKey(password, v.salt)
+// 		v.aead, err = chacha20poly1305.NewX(key)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+
+// 		if err := v.saveIndexLocked(); err != nil {
+// 			return nil, err
+// 		}
+// 		return v, nil
+// 	}
+
+// 	if _, err := os.Stat(indexFile); os.IsNotExist(err) {
+// 		return nil, errors.New("nessun Vault trovato in questo percorso: usa 'Inizializza Nuovo Vault'")
+// 	}
+
+// 	v.salt, err = os.ReadFile(saltFile)
+// 	if err != nil || len(v.salt) != SaltSize {
+// 		return nil, errors.New("file salt corrotto o illeggibile")
+// 	}
+
+// 	key := deriveKey(password, v.salt)
+// 	v.aead, err = chacha20poly1305.NewX(key)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	if err := v.loadIndex(); err != nil {
+// 		return nil, errors.New("password errata o indice corrotto")
+// 	}
+
+//		return v, nil
+//	}
+func wrapDEK(kek, dek []byte) ([]byte, error) {
+	kekAEAD, err := chacha20poly1305.NewX(kek)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, NonceSize)
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	wrapped := kekAEAD.Seal(nil, nonce, dek, []byte(KeyWrapAAD))
+	return append(nonce, wrapped...), nil
+}
+
+func unwrapDEK(kek, packet []byte) ([]byte, error) {
+	if len(packet) != NonceSize+KeySize+chacha20poly1305.Overhead {
+		return nil, errors.New("file vault.key corrotto")
+	}
+	kekAEAD, err := chacha20poly1305.NewX(kek)
+	if err != nil {
+		return nil, err
+	}
+	return kekAEAD.Open(nil, packet[:NonceSize], packet[NonceSize:], []byte(KeyWrapAAD))
+}
+
 func InitOrOpenVault(usbMountPath, password string, createNew bool) (*SecureVault, error) {
 	vaultDir := filepath.Join(usbMountPath, ".secure_vault")
 	blocksDir := filepath.Join(vaultDir, "blocks")
 	saltFile := filepath.Join(vaultDir, "vault.salt")
+	keyFile := filepath.Join(vaultDir, "vault.key")
 	indexFile := filepath.Join(vaultDir, "index.meta")
 
-	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	encoder, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
+		zstd.WithWindowSize(ChunkSize),
+		zstd.WithEncoderConcurrency(1),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -89,12 +198,24 @@ func InitOrOpenVault(usbMountPath, password string, createNew bool) (*SecureVaul
 			return nil, err
 		}
 
-		key := deriveKey(password, v.salt)
-		v.aead, err = chacha20poly1305.NewX(key)
+		// Genera DEK casuale a 256-bit e la cifra con la KEK derivata dalla password
+		v.dek = make([]byte, KeySize)
+		if _, err := io.ReadFull(rand.Reader, v.dek); err != nil {
+			return nil, err
+		}
+		kek := deriveKey(password, v.salt)
+		wrappedKey, err := wrapDEK(kek, v.dek)
 		if err != nil {
 			return nil, err
 		}
+		if err := os.WriteFile(keyFile, wrappedKey, 0600); err != nil {
+			return nil, err
+		}
 
+		v.aead, err = chacha20poly1305.NewX(v.dek)
+		if err != nil {
+			return nil, err
+		}
 		if err := v.saveIndexLocked(); err != nil {
 			return nil, err
 		}
@@ -110,14 +231,30 @@ func InitOrOpenVault(usbMountPath, password string, createNew bool) (*SecureVaul
 		return nil, errors.New("file salt corrotto o illeggibile")
 	}
 
-	key := deriveKey(password, v.salt)
-	v.aead, err = chacha20poly1305.NewX(key)
+	kek := deriveKey(password, v.salt)
+	if wrappedBytes, err := os.ReadFile(keyFile); err == nil {
+		v.dek, err = unwrapDEK(kek, wrappedBytes)
+		if err != nil {
+			return nil, errors.New("password errata o vault.key manomesso")
+		}
+	} else {
+		// Migrazione trasparente per Vault creati prima del Key Wrapping
+		v.dek = kek
+	}
+
+	v.aead, err = chacha20poly1305.NewX(v.dek)
 	if err != nil {
 		return nil, err
 	}
-
 	if err := v.loadIndex(); err != nil {
 		return nil, errors.New("password errata o indice corrotto")
+	}
+
+	// Se vault.key non esisteva ancora, lo salva ora per abilitare il Key Wrapping
+	if _, err := os.Stat(keyFile); os.IsNotExist(err) {
+		if wrapped, wErr := wrapDEK(kek, v.dek); wErr == nil {
+			_ = os.WriteFile(keyFile, wrapped, 0600)
+		}
 	}
 
 	return v, nil
@@ -611,4 +748,186 @@ func SecureEraseFile(path string) {
 		}
 	}
 	_ = os.Remove(path)
+}
+
+// Search esegue una ricerca istantanea in RAM su tutto l'indice cifrato.
+func (v *SecureVault) Search(query string) []FileEntry {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil
+	}
+
+	var results []FileEntry
+	for _, entry := range v.index.Entries {
+		if entry.VirtualPath == "/" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(entry.VirtualPath), q) {
+			results = append(results, entry)
+		}
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].IsDir != results[j].IsDir {
+			return results[i].IsDir
+		}
+		return strings.ToLower(results[i].VirtualPath) < strings.ToLower(results[j].VirtualPath)
+	})
+	return results
+}
+
+// ChangePassword cambia istantaneamente la password ricifrando solo la DEK a 256-bit (Key Wrapping)
+// senza toccare i blocchi dati sulla chiavetta USB.
+func (v *SecureVault) ChangePassword(oldPassword, newPassword string) error {
+	if len(newPassword) < 6 {
+		return errors.New("la nuova password deve contenere almeno 6 caratteri")
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	oldKEK := deriveKey(oldPassword, v.salt)
+	keyFile := filepath.Join(v.rootPath, "vault.key")
+	if wrappedBytes, err := os.ReadFile(keyFile); err == nil {
+		if _, err := unwrapDEK(oldKEK, wrappedBytes); err != nil {
+			return errors.New("la password attuale inserita non è corretta")
+		}
+	} else if !bytes.Equal(oldKEK, v.dek) {
+		return errors.New("la password attuale inserita non è corretta")
+	}
+
+	newSalt := make([]byte, SaltSize)
+	if _, err := io.ReadFull(rand.Reader, newSalt); err != nil {
+		return err
+	}
+	newKEK := deriveKey(newPassword, newSalt)
+	newWrapped, err := wrapDEK(newKEK, v.dek)
+	if err != nil {
+		return err
+	}
+
+	saltFile := filepath.Join(v.rootPath, "vault.salt")
+	if err := os.WriteFile(keyFile+".tmp", newWrapped, 0600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(saltFile+".tmp", newSalt, 0600); err != nil {
+		_ = os.Remove(keyFile + ".tmp")
+		return err
+	}
+	if err := os.Rename(keyFile+".tmp", keyFile); err != nil {
+		return err
+	}
+	if err := os.Rename(saltFile+".tmp", saltFile); err != nil {
+		return err
+	}
+
+	v.salt = newSalt
+	return nil
+}
+
+// VerifyIntegrity esegue lo scrubbing parallelo su tutti i core verificando i tag Poly1305
+// di ogni singolo chunk da 4 MB senza bisogno di decomprimere con Zstd.
+func (v *SecureVault) VerifyIntegrity(onProgress ProgressFunc) (IntegrityReport, error) {
+	v.mu.RLock()
+	var files []FileEntry
+	var totalDiskBytes int64
+	for _, e := range v.index.Entries {
+		if !e.IsDir {
+			files = append(files, e)
+			totalDiskBytes += e.DiskSize
+		}
+	}
+	v.mu.RUnlock()
+
+	var report IntegrityReport
+	report.FilesChecked = len(files)
+
+	var processedBytes int64
+	var mu sync.Mutex
+	workers := runtime.NumCPU()
+	if workers < 2 {
+		workers = 2
+	}
+
+	fileCh := make(chan FileEntry, len(files))
+	for _, f := range files {
+		fileCh <- f
+	}
+	close(fileCh)
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var compScratch []byte
+			for entry := range fileCh {
+				chunksOK, err := v.verifySingleFilePoly1305(entry, &compScratch)
+				mu.Lock()
+				if err != nil {
+					report.CorruptedFiles = append(report.CorruptedFiles, fmt.Sprintf("%s (%v)", entry.VirtualPath, err))
+				} else {
+					report.ChunksVerified += chunksOK
+					report.BytesVerified += entry.DiskSize
+				}
+				processedBytes += entry.DiskSize
+				if onProgress != nil {
+					onProgress(processedBytes, totalDiskBytes)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	sort.Strings(report.CorruptedFiles)
+	return report, nil
+}
+
+func (v *SecureVault) verifySingleFilePoly1305(entry FileEntry, compScratch *[]byte) (int, error) {
+	blobPath := filepath.Join(v.rootPath, "blocks", entry.BlobID)
+	f, err := os.Open(blobPath)
+	if err != nil {
+		return 0, errors.New("blocco mancante su disco")
+	}
+	defer f.Close()
+
+	header := make([]byte, HeaderSize)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return 0, errors.New("header troncato")
+	}
+	if string(header[:len(VaultStreamMagic)]) != VaultStreamMagic {
+		return 0, errors.New("magic SVAULT03 non valido")
+	}
+	streamID := header[len(VaultStreamMagic):]
+
+	var lenBuf [4]byte
+	var cipherBuf []byte
+	for idx, expectedLen := range entry.ChunkSizes {
+		if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
+			return idx, fmt.Errorf("chunk %d mancante", idx)
+		}
+		gotLen := uint32(lenBuf[0]) | uint32(lenBuf[1])<<8 | uint32(lenBuf[2])<<16 | uint32(lenBuf[3])<<24
+		if gotLen != expectedLen {
+			return idx, fmt.Errorf("lunghezza chunk %d alterata", idx)
+		}
+		if cap(cipherBuf) < int(gotLen) {
+			cipherBuf = make([]byte, gotLen)
+		} else {
+			cipherBuf = cipherBuf[:gotLen]
+		}
+		if _, err := io.ReadFull(f, cipherBuf); err != nil {
+			return idx, fmt.Errorf("chunk %d troncato", idx)
+		}
+
+		isFinal := (idx == len(entry.ChunkSizes)-1)
+		nonce, aad := buildChunkNonceAndAAD(streamID, uint64(idx), isFinal)
+		if _, err := v.aead.Open((*compScratch)[:0], nonce, cipherBuf, aad); err != nil {
+			return idx, fmt.Errorf("tag Poly1305 invalido al chunk %d", idx)
+		}
+	}
+	return len(entry.ChunkSizes), nil
 }

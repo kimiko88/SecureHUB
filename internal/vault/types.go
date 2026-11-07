@@ -14,7 +14,7 @@ import (
 
 const (
 	SaltSize           = 16
-	KeySize            = chacha20poly1305.KeySize   // 32 byte (256-bit)
+	KeySize            = chacha20poly1305.KeySize    // 32 byte (256-bit)
 	NonceSize          = chacha20poly1305.NonceSizeX // 24 byte (192-bit)
 	StreamIDSize       = 15                          // 15B StreamID + 8B ChunkCounter + 1B FinalFlag = 24B Nonce
 	HeaderSize         = 8 + StreamIDSize            // 8B Magic + 15B StreamID = 23 byte
@@ -43,10 +43,13 @@ type VaultIndex struct {
 	Entries map[string]FileEntry `json:"entries"`
 }
 
+const KeyWrapAAD = "SVAULT03-KEYWRAP"
+
 type SecureVault struct {
 	mu             sync.RWMutex
 	rootPath       string
 	salt           []byte
+	dek            []byte // Master Data Encryption Key (32B) protetta da Key Wrapping
 	aead           cipher.AEAD
 	encoder        *zstd.Encoder
 	decoder        *zstd.Decoder
@@ -54,6 +57,14 @@ type SecureVault struct {
 	index          VaultIndex
 	streamListener net.Listener
 	streamToken    string
+}
+
+// IntegrityReport riassume l'esito dello scrubbing Poly1305 globale
+type IntegrityReport struct {
+	FilesChecked   int
+	ChunksVerified int
+	BytesVerified  int64
+	CorruptedFiles []string
 }
 
 func deriveKey(password string, salt []byte) []byte {

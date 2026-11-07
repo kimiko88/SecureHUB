@@ -2,6 +2,10 @@
 # SECUREUSB / SECUREHUB — ROOT .GITIGNORE (Go + Rust Multi-Platform Architecture)
 # ==============================================================================
 
+# Protegge esplicitamente il workspace Rust anche su filesystem case-insensitive (Windows NTFS)
+!/secureusb-rs/
+!/secureusb-rs/**
+
 # ------------------------------------------------------------------------------
 # 1. ARTEFATTI DI BUILD & RELEASE (Go & Rust)
 # ------------------------------------------------------------------------------
@@ -10,7 +14,8 @@
 /build/
 /bin/
 
-# Specific compiled binary names (avoiding broad wildcards that match folders)
+# Eseguibili e librerie compilate
+*.exe
 *.exe~
 *.dll
 *.pyd
@@ -21,51 +26,47 @@
 *.dylib
 *.a
 
-# Go specific build outputs in root
+# Binari Go compilati nella root (senza wildcard che catturino secureusb-rs)
 /secureusb
-/secureusb-linux*
-/secureusb-mac*
+/secureusb-linux
+/secureusb-linux-amd64
+/secureusb-mac
+/secureusb-macos
+/secureusb-go-*
 
 # ------------------------------------------------------------------------------
-# 2. RUST / CARGO SPECIFICS (Workspace & Sottocartelle)
+# 2. RUST / CARGO BUILD TARGETS
 # ------------------------------------------------------------------------------
 **/target/
-target/
-secureusb-rs/target/
-
-# Backup and temporary files
+/secureusb-rs/target/
+/secureusb-rs/fuzz/target/
 **/*.rs.bk
 *.rs.bk
 Cargo.lock.orig
 
 # ------------------------------------------------------------------------------
-# 3. FUZZING & BENCHMARKING (Go Native Fuzz + cargo-fuzz / libFuzzer + Criterion)
+# 3. FUZZING & BENCHMARKING (Go Native Fuzz + cargo-fuzz + Criterion)
 # ------------------------------------------------------------------------------
 **/fuzz/artifacts/
-fuzz/artifacts/
+**/fuzz/corpus/
 fuzz_crash_*
 crash-*
 leak-*
 timeout-*
 oom-*
-**/fuzz/corpus/
-fuzz/corpus/
 testdata/fuzz/
-**/target/criterion/
 
 # ------------------------------------------------------------------------------
-# 4. GO SPECIFICS (Test, Coverage & Moduli)
+# 4. GO TEST & COVERAGE
 # ------------------------------------------------------------------------------
 *.test
 *.out
 cover.out
 coverage.html
-profile.pprof
-cpu.pprof
-mem.pprof
+*.pprof
 
 # ------------------------------------------------------------------------------
-# 5. TEST VAULT & DISCHI VIRTUALI
+# 5. TEST VAULT & FILE TEMPORANEI
 # ------------------------------------------------------------------------------
 .secure_vault/
 **/.secure_vault/
@@ -76,37 +77,25 @@ mem.pprof
 /tmp/secureusb_mount*
 
 # ------------------------------------------------------------------------------
-# 6. IDE, EDITOR & TOOLCHAIN
+# 6. IDE, EDITOR & SISTEMA OPERATIVO
 # ------------------------------------------------------------------------------
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
 *.code-workspace
-
 .idea/
 *.iws
 *.iml
 *.ipr
-
 .*.swp
 .*.swo
 *~
 *.bak
 *.gch
-
-# ------------------------------------------------------------------------------
-# 7. SISTEMA OPERATIVO
-# ------------------------------------------------------------------------------
 .DS_Store
-.AppleDouble
-.LSOverride
-._*
-.Spotlight-V100
-.Trashes
 Thumbs.db
-Thumbs.db:encryptable
 ehthumbs.db
-ehthumbs_vista.db
 [Dd]esktop.ini
-$RECYCLE.BIN/
+
+generate_*

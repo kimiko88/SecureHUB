@@ -2,18 +2,15 @@ name: SecureUSB CI/CD — Build & Test (Go + Rust)
 
 on:
   push:
-    branches: ["main", "master"]
-    tags: ["v*"]
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
   pull_request:
-    branches: ["main", "master"]
+    branches: [ "main", "master" ]
 
 permissions:
   contents: write
 
 jobs:
-  # ==========================================================================
-  # 1. SUITE DI TEST, RACE DETECTOR, FUZZING BREVE E BENCHMARK (GO + RUST)
-  # ==========================================================================
   verify-and-test:
     name: Test, Fuzz & Bench (Ubuntu)
     runs-on: ubuntu-latest
@@ -26,10 +23,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dev xorg-dev libfuse-dev exfatprogs pkg-config
 
-      - name: Setup Go 1.22
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: ">=1.22"
 
       - name: Setup Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -56,19 +53,7 @@ jobs:
         working-directory: secureusb-rs
         run: |
           cargo bench --bench vault_bench -- --quick
-      - name: Verify WinFsp headers (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          test -f "/c/Program Files (x86)/WinFsp/inc/fuse/fuse_common.h" || {
-            echo "Header WinFsp mancanti"
-            exit 1
-          }
-          gcc --version
 
-  # ==========================================================================
-  # 2. MATRICE DI COMPILAZIONE CROSS-PLATFORM (LINUX, WINDOWS, MACOS) — GO & RUST
-  # ==========================================================================
   build-matrix:
     name: Build (${{ matrix.os_name }} — Go & Rust)
     needs: verify-and-test
@@ -97,69 +82,55 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ">=1.22"
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install Linux Dependencies (FUSE & X11/OpenGL)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dev xorg-dev libfuse-dev pkg-config
 
-      - name: Install Windows Dependencies (WinFsp + Developer C Headers)
+      - name: Install Windows Dependencies (WinFsp + MinGW System Headers)
         if: runner.os == 'Windows'
         shell: bash
-        env:
-          CGO_ENABLED: "1"
-          CPATH: "C:\\Program Files (x86)\\WinFsp\\inc\\fuse"
         run: |
-          mkdir -p dist
-
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            go mod tidy
-            go build -ldflags="-s -w -H=windowsgui" -o "dist/${{ matrix.go_bin }}" .
-
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            export CGO_CFLAGS="-I/usr/local/include/fuse -D_FILE_OFFSET_BITS=64"
-            go mod tidy
-            go build -ldflags="-s -w" -o "dist/${{ matrix.go_bin }}" .
-
-          else
-            go mod tidy
-            go build -ldflags="-s -w" -o "dist/${{ matrix.go_bin }}" .
+          git clone --depth 1 https://github.com/winfsp/winfsp.git /c/winfsp_sdk
+          GCC_BIN_DIR="$(dirname "$(which gcc)")"
+          MINGW_ROOT="$(cd "$GCC_BIN_DIR/.." && pwd)"
+          echo "MinGW root rilevata: $MINGW_ROOT"
+          cp -vf /c/winfsp_sdk/inc/fuse/* "$MINGW_ROOT/include/" || true
+          if [ -d "$MINGW_ROOT/x86_64-w64-mingw32/include" ]; then
+            cp -vf /c/winfsp_sdk/inc/fuse/* "$MINGW_ROOT/x86_64-w64-mingw32/include/" || true
           fi
+          echo "CGO_ENABLED=1" >> $GITHUB_ENV
+          echo "CPATH=C:/winfsp_sdk/inc/fuse;C:/winfsp_sdk/inc" >> $GITHUB_ENV
+          echo "C_INCLUDE_PATH=C:/winfsp_sdk/inc/fuse;C:/winfsp_sdk/inc" >> $GITHUB_ENV
+          echo "CGO_CFLAGS=-IC:/winfsp_sdk/inc/fuse -IC:/winfsp_sdk/inc" >> $GITHUB_ENV
 
-      - name: Install macOS Dependencies (FUSE C Headers for cgofuse)
+      - name: Install macOS Dependencies (FUSE Headers)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          brew install --cask macfuse || true
-          if [ ! -f "/usr/local/include/fuse/fuse_common.h" ]; then
-            echo "Configurazione header FUSE in /usr/local/include/fuse per macOS..."
-            git clone --depth 1 https://github.com/winfsp/winfsp.git /tmp/winfsp_src
-            sudo mkdir -p /usr/local/include/fuse
-            sudo cp -r /tmp/winfsp_src/inc/fuse/* /usr/local/include/fuse/
-          fi
-
-      - name: Setup Go 1.22
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+          git clone --depth 1 https://github.com/winfsp/winfsp.git /tmp/winfsp_sdk
+          echo "CGO_ENABLED=1" >> $GITHUB_ENV
+          echo "CPATH=/tmp/winfsp_sdk/inc/fuse:/tmp/winfsp_sdk/inc" >> $GITHUB_ENV
+          echo "C_INCLUDE_PATH=/tmp/winfsp_sdk/inc/fuse:/tmp/winfsp_sdk/inc" >> $GITHUB_ENV
+          echo "CGO_CFLAGS=-I/tmp/winfsp_sdk/inc/fuse -I/tmp/winfsp_sdk/inc -D_FILE_OFFSET_BITS=64" >> $GITHUB_ENV
 
       - name: Build Go Executable (${{ matrix.os_name }})
         shell: bash
         run: |
-          export CGO_ENABLED=1
+          mkdir -p dist
+          go mod tidy
           if [ "${{ runner.os }}" = "Windows" ]; then
-            export CGO_CFLAGS="-I'C:/Program Files (x86)/WinFsp/inc/fuse' -I'C:/Program Files (x86)/WinFsp/inc'"
-            go mod tidy
             go build -ldflags="-s -w -H=windowsgui" -o "dist/${{ matrix.go_bin }}" .
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            export CGO_CFLAGS="-I/usr/local/include/fuse -D_FILE_OFFSET_BITS=64"
-            go mod tidy
-            go build -ldflags="-s -w" -o "dist/${{ matrix.go_bin }}" .
           else
-            go mod tidy
             go build -ldflags="-s -w" -o "dist/${{ matrix.go_bin }}" .
           fi
 
@@ -177,9 +148,6 @@ jobs:
           name: binaries-${{ matrix.os_name }}
           path: dist/*
 
-  # ==========================================================================
-  # 3. PUBBLICAZIONE AUTOMATICA SU GITHUB RELEASES (SU TAG v*)
-  # ==========================================================================
   publish-release:
     name: Publish GitHub Release (6 Executables)
     needs: build-matrix

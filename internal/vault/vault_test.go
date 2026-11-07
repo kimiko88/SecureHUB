@@ -12,11 +12,11 @@ import (
 )
 
 // ============================================================================
-// 1. UNIT TESTS
+// 1. UNIT TESTS (Nonce/AAD, Path Normalization & OS Junk File Filter)
 // ============================================================================
 
 func TestChunkNonceAndAAD_Unit(t *testing.T) {
-	streamID := []byte("0123456789abcde") // 15 byte
+	streamID := []byte("0123456789abcde")
 	n1, a1 := buildChunkNonceAndAAD(streamID, 0, false)
 	n2, a2 := buildChunkNonceAndAAD(streamID, 1, false)
 	n3, a3 := buildChunkNonceAndAAD(streamID, 1, true)
@@ -47,8 +47,48 @@ func TestNormalizePath_Unit(t *testing.T) {
 	}
 }
 
+func TestShouldIgnoreFile_Unit(t *testing.T) {
+	ignored := []string{
+		".DS_Store",
+		"/path/to/.ds_store",
+		"Thumbs.db",
+		"thumbs.db:encryptable",
+		"ehthumbs.db",
+		"desktop.ini",
+		"Desktop.INI",
+		"._foto_vacanze.jpg",
+		"~$Contratto.docx",
+		"scaricamento.tmp",
+		"backup.bak",
+		".file.swp",
+		"editor~",
+		".Spotlight-V100",
+		".Trashes",
+		"$RECYCLE.BIN",
+		".secure_vault",
+	}
+	for _, item := range ignored {
+		if !ShouldIgnoreFile(item) {
+			t.Errorf("ShouldIgnoreFile(%q) = false, atteso true (file temporaneo/spazzatura)", item)
+		}
+	}
+
+	valid := []string{
+		"relazione.pdf",
+		"codice.go",
+		"video_4k.mp4",
+		".gitignore",
+		"README.md",
+	}
+	for _, item := range valid {
+		if ShouldIgnoreFile(item) {
+			t.Errorf("ShouldIgnoreFile(%q) = true, atteso false (file utente valido)", item)
+		}
+	}
+}
+
 // ============================================================================
-// 2. INTEGRATION TESTS (Pipeline Multi-Core Multi-Chunk + Rilevamento Manomissioni)
+// 2. INTEGRATION TESTS (Pipeline Parallela, Tamper Detection & ImportDir/ExportDir)
 // ============================================================================
 
 func TestParallelPipelineMultiChunk_Integration(t *testing.T) {
@@ -59,10 +99,8 @@ func TestParallelPipelineMultiChunk_Integration(t *testing.T) {
 	}
 	defer v.Close()
 
-	// Genera 10.5 MB di dati misti (attraversa 3 chunk da 4 MB: 4MB + 4MB + 2.5MB)
 	totalSize := 2*ChunkSize + (ChunkSize / 2) + 12345
 	original := make([]byte, totalSize)
-	// Prima metà comprimibile, seconda metà entropia casuale
 	for i := 0; i < totalSize/2; i++ {
 		original[i] = byte(i % 251)
 	}
@@ -89,6 +127,114 @@ func TestParallelPipelineMultiChunk_Integration(t *testing.T) {
 	}
 }
 
+func TestImportAndExportDirRecursiveWithJunkFilter_Integration(t *testing.T) {
+	vaultUSBDir := t.TempDir()
+	srcRootDir := filepath.Join(t.TempDir(), "ProgettoSegreto")
+	exportDestDir := t.TempDir()
+
+	// Crea gerarchia di sottocartelle locali
+	subSrc := filepath.Join(srcRootDir, "src", "core")
+	subDocs := filepath.Join(srcRootDir, "docs")
+	junkDir := filepath.Join(srcRootDir, ".Spotlight-V100")
+	for _, d := range []string{subSrc, subDocs, junkDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// File utente validi
+	validFiles := map[string][]byte{
+		filepath.Join(srcRootDir, "README.md"):          []byte("# Progetto Segreto SVAULT03"),
+		filepath.Join(subSrc, "engine.go"):              bytes.Repeat([]byte("package core\n"), 5000),
+		filepath.Join(subDocs, "specifica_tecnica.pdf"): []byte("%PDF-1.7 contenuto riservato"),
+	}
+	for path, content := range validFiles {
+		if err := os.WriteFile(path, content, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// File spazzatura / temporanei che DEVONO essere esclusi automaticamente
+	junkFiles := []string{
+		filepath.Join(srcRootDir, ".DS_Store"),
+		filepath.Join(srcRootDir, "Thumbs.db"),
+		filepath.Join(subSrc, "desktop.ini"),
+		filepath.Join(subSrc, "._engine.go"),
+		filepath.Join(subDocs, "~$specifica_tecnica.pdf"),
+		filepath.Join(subDocs, "bozza.tmp"),
+		filepath.Join(junkDir, "index.bin"),
+	}
+	for _, jPath := range junkFiles {
+		if err := os.WriteFile(jPath, []byte("junk data"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	v, err := InitOrOpenVault(vaultUSBDir, "DirImportPass!", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+
+	if err := v.CreateDir("/Archivio"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Importazione ricorsiva della cartella
+	var lastDone, lastTotal int64
+	importedCount, err := v.ImportDir(srcRootDir, "/Archivio", func(done, total int64) {
+		lastDone = done
+		lastTotal = total
+	})
+	if err != nil {
+		t.Fatalf("ImportDir fallito: %v", err)
+	}
+	if importedCount != 3 {
+		t.Fatalf("attesi esattamente 3 file validi importati, ottenuti %d", importedCount)
+	}
+	if lastDone != lastTotal || lastTotal == 0 {
+		t.Fatalf("progresso ImportDir incompleto: %d / %d", lastDone, lastTotal)
+	}
+
+	// Verifica assenza dei file temporanei nell'indice cifrato
+	for _, forbidden := range []string{
+		"/Archivio/ProgettoSegreto/.DS_Store",
+		"/Archivio/ProgettoSegreto/Thumbs.db",
+		"/Archivio/ProgettoSegreto/src/core/desktop.ini",
+		"/Archivio/ProgettoSegreto/src/core/._engine.go",
+		"/Archivio/ProgettoSegreto/docs/~$specifica_tecnica.pdf",
+		"/Archivio/ProgettoSegreto/docs/bozza.tmp",
+		"/Archivio/ProgettoSegreto/.Spotlight-V100/index.bin",
+	} {
+		if _, exists := v.Stat(forbidden); exists {
+			t.Fatalf("il file temporaneo %s non è stato filtrato durante ImportDir!", forbidden)
+		}
+	}
+
+	// 2. Esportazione ricorsiva della cartella verso il PC
+	exportedCount, err := v.ExportDir("/Archivio/ProgettoSegreto", exportDestDir, nil)
+	if err != nil {
+		t.Fatalf("ExportDir fallito: %v", err)
+	}
+	if exportedCount != 3 {
+		t.Fatalf("attesi 3 file esportati, ottenuti %d", exportedCount)
+	}
+
+	// 3. Verifica integrità byte-per-byte dei file esportati
+	exportedBase := filepath.Join(exportDestDir, "ProgettoSegreto")
+	for origPath, expectedBytes := range validFiles {
+		rel, _ := filepath.Rel(srcRootDir, origPath)
+		expPath := filepath.Join(exportedBase, rel)
+		gotBytes, err := os.ReadFile(expPath)
+		if err != nil {
+			t.Fatalf("file esportato mancante %s: %v", expPath, err)
+		}
+		if !bytes.Equal(gotBytes, expectedBytes) {
+			t.Fatalf("contenuto file esportato %s diverso dall'originale", expPath)
+		}
+	}
+}
+
 func TestTamperAndTruncationDetection_Integration(t *testing.T) {
 	tmpDir := t.TempDir()
 	v, err := InitOrOpenVault(tmpDir, "ChiaveSegreta123!", true)
@@ -109,7 +255,6 @@ func TestTamperAndTruncationDetection_Integration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 1. Test Bit-Flip a metà del primo chunk
 	corrupted := append([]byte(nil), rawDisk...)
 	corrupted[HeaderSize+50] ^= 0xFF
 	if err := os.WriteFile(blobPath, corrupted, 0600); err != nil {
@@ -119,7 +264,6 @@ func TestTamperAndTruncationDetection_Integration(t *testing.T) {
 		t.Fatal("la decifratura avrebbe dovuto fallire su blocco manomesso (Poly1305)")
 	}
 
-	// 2. Test Troncamento del secondo chunk (rimozione flag EOF)
 	firstChunkTotal := HeaderSize + 4 + int(entry.ChunkSizes[0])
 	truncated := rawDisk[:firstChunkTotal]
 	if err := os.WriteFile(blobPath, truncated, 0600); err != nil {
@@ -131,14 +275,13 @@ func TestTamperAndTruncationDetection_Integration(t *testing.T) {
 }
 
 // ============================================================================
-// 3. END-TO-END (E2E) TEST (Ciclo di vita completo + Seeker O(1) + HTTP Range)
+// 3. END-TO-END (E2E) TEST
 // ============================================================================
 
 func TestEndToEndLifecycle_E2E(t *testing.T) {
 	tmpDir := t.TempDir()
 	password := "E2E-MasterKey-99!"
 
-	// 1. Creazione Vault e struttura directory
 	v, err := InitOrOpenVault(tmpDir, password, true)
 	if err != nil {
 		t.Fatalf("creazione vault fallita: %v", err)
@@ -147,7 +290,6 @@ func TestEndToEndLifecycle_E2E(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 2. Scrittura video simulato da 9 MB (3 chunk)
 	videoData := make([]byte, 2*ChunkSize+1024*1024)
 	for i := range videoData {
 		videoData[i] = byte((i * 31) & 0xFF)
@@ -157,19 +299,16 @@ func TestEndToEndLifecycle_E2E(t *testing.T) {
 	}
 	v.Close()
 
-	// 3. Tentativo di riapertura con password errata
 	if _, err := InitOrOpenVault(tmpDir, "PasswordSbagliata", false); err == nil {
 		t.Fatal("apertura con password errata non bloccata")
 	}
 
-	// 4. Riapertura con password corretta
 	v2, err := InitOrOpenVault(tmpDir, password, false)
 	if err != nil {
 		t.Fatalf("riapertura vault fallita: %v", err)
 	}
 	defer v2.Close()
 
-	// 5. Verifica Random-Access Seeker O(1) a cavallo del confine tra chunk 0 e chunk 1
 	seeker, err := v2.OpenReadSeeker("/Video/film.mp4")
 	if err != nil {
 		t.Fatal(err)
@@ -188,7 +327,6 @@ func TestEndToEndLifecycle_E2E(t *testing.T) {
 		t.Fatal("mismatch nei dati letti tramite Seek sul confine dei 4 MB")
 	}
 
-	// 6. Verifica Server HTTP di Streaming con header "Range: bytes=..."
 	streamURL, err := v2.GetStreamURL("/Video/film.mp4")
 	if err != nil {
 		t.Fatal(err)
@@ -218,7 +356,6 @@ func TestEndToEndLifecycle_E2E(t *testing.T) {
 		t.Fatal("il payload HTTP Range non coincide con la finestra richiesta")
 	}
 
-	// 7. Eliminazione sicura
 	if err := v2.Delete("/Video/film.mp4"); err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +365,7 @@ func TestEndToEndLifecycle_E2E(t *testing.T) {
 }
 
 // ============================================================================
-// 4. FUZZ TEST (Go Native Fuzzing: Round-Trip + Random-Access Seeker)
+// 4. FUZZ TEST
 // ============================================================================
 
 func FuzzVaultRoundTripAndSeeker(f *testing.F) {
@@ -275,7 +412,6 @@ func FuzzVaultRoundTripAndSeeker(f *testing.F) {
 		}
 		defer seeker.Close()
 
-		// Normalizza l'offset all'interno della dimensione del payload
 		normOffset := seekOffset % int64(len(payload))
 		if normOffset < 0 {
 			normOffset = -normOffset
@@ -299,7 +435,7 @@ func FuzzVaultRoundTripAndSeeker(f *testing.F) {
 }
 
 // ============================================================================
-// 5. BENCHMARKS (Throughput MB/s Pipeline Parallela e Seeker O(1))
+// 5. BENCHMARKS
 // ============================================================================
 
 func BenchmarkParallelEncryptStream(b *testing.B) {
@@ -310,7 +446,6 @@ func BenchmarkParallelEncryptStream(b *testing.B) {
 	}
 	defer v.Close()
 
-	// Payload da 16 MB (4 chunk da 4 MB)
 	data := bytes.Repeat([]byte("BenchmarkDataBlockForZstdAndXChaCha20Poly1305!"), (16*1024*1024)/46+1)[:16*1024*1024]
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
@@ -358,7 +493,6 @@ func BenchmarkRandomAccessSeekO1(b *testing.B) {
 	}
 	defer v.Close()
 
-	// File da 16 MB (4 chunk)
 	data := make([]byte, 16*1024*1024)
 	_, _ = rand.Read(data)
 	if err := v.WriteFile("/random.bin", data); err != nil {
@@ -377,7 +511,6 @@ func BenchmarkRandomAccessSeekO1(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		// Salta all'interno dello stesso chunk o tra chunk con ReadAt
 		offset := int64((i * 65536) % (15 * 1024 * 1024))
 		if _, err := seeker.ReadAt(readBuf, offset); err != nil && err != io.EOF {
 			b.Fatal(err)

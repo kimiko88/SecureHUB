@@ -25,8 +25,8 @@ import (
 
 func Run() {
 	a := app.NewWithID("it.secureusb.explorer.v3")
-	w := a.NewWindow(fmt.Sprintf("SecureUSB Explorer — SVAULT03 (%d Core) + FUSE/WinFsp + PDF/Image Viewer", runtime.NumCPU()))
-	w.Resize(fyne.NewSize(1180, 720))
+	w := a.NewWindow(fmt.Sprintf("SecureUSB Explorer — SVAULT03 (%d Core) + Drag&Drop + FUSE/WinFsp", runtime.NumCPU()))
+	w.Resize(fyne.NewSize(1220, 720))
 
 	showUnlockScreen(w)
 	w.ShowAndRun()
@@ -34,7 +34,14 @@ func Run() {
 
 func showUnlockScreen(w fyne.Window) {
 	usbPathEntry := widget.NewEntry()
-	usbPathEntry.SetPlaceHolder("Percorso della chiavetta montata (es. E:\\, /Volumes/SECURE_USB, /media/usb)")
+	usbPathEntry.SetPlaceHolder("Percorso della chiavetta montata (oppure trascina qui la cartella della USB)")
+
+	// Drag & Drop sulla schermata di sblocco: imposta automaticamente il percorso della USB
+	w.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
+		if len(uris) > 0 {
+			usbPathEntry.SetText(uris[0].Path())
+		}
+	})
 
 	browseBtn := widget.NewButtonWithIcon("Sfoglia Cartella USB", theme.FolderOpenIcon(), func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
@@ -109,7 +116,7 @@ func showUnlockScreen(w fyne.Window) {
 	})
 
 	card := container.NewVBox(
-		widget.NewLabelWithStyle("Sblocco e Gestione Chiavetta Cifrata (Multi-Core + FUSE/WinFsp + Viewer Integrato)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("Sblocco e Gestione Chiavetta Cifrata (Supporto Drag & Drop Attivo)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewBorder(nil, nil, nil, browseBtn, usbPathEntry),
 		passEntry,
 		container.NewGridWithColumns(2, openBtn, initBtn),
@@ -128,11 +135,11 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	var selectedEntry *vault.FileEntry
 	var unmountFuse func()
 
-	pathLabel := widget.NewLabelWithStyle("Percorso: /", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	infoLabel := widget.NewLabel("Seleziona un file per visualizzarlo (Testo, Immagini PNG/JPG/GIF, PDF o Video in Streaming).")
+	pathLabel := widget.NewLabelWithStyle("Percorso: / (Trascina qui file o cartelle dal PC per importarli)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	infoLabel := widget.NewLabel("Seleziona un file o trascina file/cartelle nella finestra.")
 
 	editor := widget.NewMultiLineEntry()
-	editor.SetPlaceHolder("Editor integrato per file di testo (fino a 16 MB). Seleziona un'immagine o un PDF per aprire automaticamente il visualizzatore integrato.")
+	editor.SetPlaceHolder("Editor integrato per file di testo (fino a 16 MB). Trascina file o cartelle in qualsiasi punto della finestra per cifrarli in SVAULT03.")
 	editor.Disable()
 
 	previewHolder := container.NewMax(editor)
@@ -146,13 +153,80 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		editor.Disable()
 		previewHolder.Objects = []fyne.CanvasObject{editor}
 		previewHolder.Refresh()
-		pathLabel.SetText("Percorso: " + currentDir)
+		pathLabel.SetText("Percorso: " + currentDir + "  —  [Drag & Drop attivo: rilascia file o cartelle qui]")
 		infoLabel.SetText(fmt.Sprintf("%d elementi nella cartella corrente", len(entries)))
 		if listWidget != nil {
 			listWidget.UnselectAll()
 			listWidget.Refresh()
 		}
 	}
+
+	// Gestione nativa Drag & Drop di file e cartelle dal sistema operativo dentro la finestra Fyne
+	w.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
+		if len(uris) == 0 {
+			return
+		}
+		prog := dialog.NewProgress("Importazione Drag & Drop Multi-Core",
+			fmt.Sprintf("Cifratura di %d elementi rilasciati in %s...", len(uris), currentDir), w)
+		prog.Show()
+
+		go func() {
+			totalImported := 0
+			var lastErr error
+
+			for idx, u := range uris {
+				localPath := u.Path()
+				if vault.ShouldIgnoreFile(localPath) {
+					continue
+				}
+				info, err := os.Stat(localPath)
+				if err != nil {
+					lastErr = err
+					continue
+				}
+
+				if info.IsDir() {
+					cnt, dErr := v.ImportDir(localPath, currentDir, func(done, total int64) {
+						if total > 0 {
+							prog.SetValue(float64(done) / float64(total))
+						}
+					})
+					if dErr != nil {
+						lastErr = dErr
+					}
+					totalImported += cnt
+				} else if info.Mode().IsRegular() {
+					inFile, fErr := os.Open(localPath)
+					if fErr != nil {
+						lastErr = fErr
+						continue
+					}
+					target := filepath.Join(currentDir, filepath.Base(localPath))
+					wErr := v.WriteStream(target, inFile, info.Size(), func(done, total int64) {
+						if total > 0 {
+							prog.SetValue(float64(done) / float64(total))
+						}
+					})
+					_ = inFile.Close()
+					if wErr != nil {
+						lastErr = wErr
+					} else {
+						totalImported++
+					}
+				}
+				prog.SetValue(float64(idx+1) / float64(len(uris)))
+			}
+
+			prog.Hide()
+			refreshList()
+			if lastErr != nil {
+				dialog.ShowError(lastErr, w)
+			} else {
+				dialog.ShowInformation("Drag & Drop Completato",
+					fmt.Sprintf("Importati e cifrati %d file in '%s' (file temporanei esclusi automaticamente).", totalImported, currentDir), w)
+			}
+		}()
+	})
 
 	listWidget = widget.NewList(
 		func() int { return len(entries) },
@@ -209,7 +283,6 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		infoLabel.SetText(fmt.Sprintf("File: %s | Reale: %s | Su disco: %s | Chunk da 4MB: %d",
 			filepath.Base(e.VirtualPath), formatBytes(e.OriginalSize), formatBytes(e.DiskSize), len(e.ChunkSizes)))
 
-		// 1. Visualizzatore Integrato per Immagini (PNG/JPG/GIF) in RAM
 		if isImageExt(e.VirtualPath) {
 			if imgView, err := buildImagePreview(v, e.VirtualPath); err == nil {
 				editor.Disable()
@@ -219,7 +292,6 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			}
 		}
 
-		// 2. Visualizzatore Integrato per PDF in RAM
 		if isPDFExt(e.VirtualPath) && e.OriginalSize <= 64*1024*1024 {
 			if pdfView, err := buildPDFPreview(v, e.VirtualPath); err == nil {
 				editor.Disable()
@@ -250,7 +322,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			editor.SetText(string(data))
 		} else {
 			editor.Disable()
-			editor.SetText("[File binario — Usa 'Stream Video al Volo', 'Monta Disco FUSE' o 'Modifica con App Esterna']")
+			editor.SetText("[File binario — Usa 'Stream Video al Volo', 'Monta Disco FUSE' o 'App Esterna']")
 		}
 	}
 
@@ -266,7 +338,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		refreshList()
 	})
 
-	newFolderBtn := widget.NewButtonWithIcon("Nuova Cartella", theme.FolderNewIcon(), func() {
+	newFolderBtn := widget.NewButtonWithIcon("+Cartella", theme.FolderNewIcon(), func() {
 		nameEntry := widget.NewEntry()
 		dialog.ShowForm("Crea Cartella", "Crea", "Annulla", []*widget.FormItem{
 			widget.NewFormItem("Nome cartella", nameEntry),
@@ -281,7 +353,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		}, w)
 	})
 
-	newFileBtn := widget.NewButtonWithIcon("Nuovo Testo", theme.DocumentCreateIcon(), func() {
+	newFileBtn := widget.NewButtonWithIcon("+Testo", theme.DocumentCreateIcon(), func() {
 		nameEntry := widget.NewEntry()
 		nameEntry.SetPlaceHolder("note.txt")
 		dialog.ShowForm("Nuovo File", "Crea", "Annulla", []*widget.FormItem{
@@ -297,7 +369,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		}, w)
 	})
 
-	importBtn := widget.NewButtonWithIcon("Importa", theme.UploadIcon(), func() {
+	importBtn := widget.NewButtonWithIcon("Importa File", theme.UploadIcon(), func() {
 		fd := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
 			if err != nil || reader == nil {
 				return
@@ -305,6 +377,11 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			filePath := reader.URI().Path()
 			fileName := reader.URI().Name()
 			_ = reader.Close()
+
+			if vault.ShouldIgnoreFile(fileName) {
+				dialog.ShowInformation("File Ignorato", "Il file selezionato è un file temporaneo di sistema.", w)
+				return
+			}
 
 			info, statErr := os.Stat(filePath)
 			var totalSize int64
@@ -363,13 +440,13 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 					return
 				}
 				dialog.ShowInformation("Cartella Importata",
-					fmt.Sprintf("Importati e cifrati %d file con successo!", count), w)
+					fmt.Sprintf("Importati e cifrati %d file (file temporanei esclusi)!", count), w)
 				refreshList()
 			}()
 		}, w)
 	})
 
-	streamPlayBtn := widget.NewButtonWithIcon("Stream Video al Volo", theme.MediaPlayIcon(), func() {
+	streamPlayBtn := widget.NewButtonWithIcon("Stream Video", theme.MediaPlayIcon(), func() {
 		if selectedEntry == nil || selectedEntry.IsDir {
 			dialog.ShowInformation("Info", "Seleziona prima un video o un file multimediale dalla lista.", w)
 			return
@@ -383,14 +460,13 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	})
 	streamPlayBtn.Importance = widget.HighImportance
 
-	// Pulsante Montaggio Disco Virtuale Nativo (FUSE / WinFsp)
 	var fuseBtn *widget.Button
-	fuseBtn = widget.NewButtonWithIcon("Monta Disco FUSE/WinFsp", theme.StorageIcon(), func() {
+	fuseBtn = widget.NewButtonWithIcon("Monta FUSE", theme.StorageIcon(), func() {
 		if unmountFuse != nil {
 			unmountFuse()
 			unmountFuse = nil
-			fuseBtn.SetText("Monta Disco FUSE/WinFsp")
-			dialog.ShowInformation("Disco Smontato", "Il disco virtuale FUSE/WinFsp è stato smontato correttamente.", w)
+			fuseBtn.SetText("Monta FUSE")
+			dialog.ShowInformation("Disco Smontato", "Il disco virtuale FUSE/WinFsp è stato smontato.", w)
 			refreshList()
 			return
 		}
@@ -421,9 +497,9 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 				return
 			}
 			unmountFuse = unmountFn
-			fuseBtn.SetText("Smonta Disco (" + mp + ")")
+			fuseBtn.SetText("Smonta (" + mp + ")")
 			dialog.ShowInformation("Disco Virtuale Attivo",
-				fmt.Sprintf("Vault montato in %s tramite FUSE/WinFsp!\nOra puoi aprirlo direttamente nel File Explorer di sistema.", mp), w)
+				fmt.Sprintf("Vault montato in %s tramite FUSE/WinFsp!", mp), w)
 		}, w)
 	})
 
@@ -435,7 +511,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		openWithSystemAppStreaming(w, v, *selectedEntry, refreshList)
 	})
 
-	exportBtn := widget.NewButtonWithIcon("Esporta", theme.DownloadIcon(), func() {
+	exportBtn := widget.NewButtonWithIcon("Esporta File", theme.DownloadIcon(), func() {
 		if selectedEntry == nil || selectedEntry.IsDir {
 			return
 		}
@@ -483,7 +559,6 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	})
 
 	exportDirBtn := widget.NewButtonWithIcon("Esporta Cartella", theme.DownloadIcon(), func() {
-		// Se è selezionata una cartella esporta quella, altrimenti esporta la directory corrente
 		targetVirtualDir := currentDir
 		if selectedEntry != nil && selectedEntry.IsDir {
 			targetVirtualDir = selectedEntry.VirtualPath
@@ -544,7 +619,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	})
 	deleteBtn.Importance = widget.DangerImportance
 
-	lockBtn := widget.NewButtonWithIcon("Blocca USB", theme.LogoutIcon(), func() {
+	lockBtn := widget.NewButtonWithIcon("Blocca", theme.LogoutIcon(), func() {
 		if unmountFuse != nil {
 			unmountFuse()
 			unmountFuse = nil
@@ -554,7 +629,13 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	})
 
 	topBar := container.NewVBox(
-		container.NewHBox(upBtn, newFolderBtn, newFileBtn, importBtn, importDirBtn, streamPlayBtn, fuseBtn, openExtBtn, exportBtn, exportDirBtn, deleteBtn, lockBtn),
+		container.NewHBox(
+			upBtn, newFolderBtn, newFileBtn,
+			importBtn, importDirBtn,
+			streamPlayBtn, fuseBtn, openExtBtn,
+			exportBtn, exportDirBtn,
+			deleteBtn, lockBtn,
+		),
 		container.NewBorder(nil, nil, pathLabel, nil, widget.NewLabel("")),
 		widget.NewSeparator(),
 	)

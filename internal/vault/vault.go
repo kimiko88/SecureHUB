@@ -20,6 +20,33 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+// ShouldIgnoreFile restituisce true per i file e le cartelle temporanee/spazzatura del sistema operativo
+// (.DS_Store, Thumbs.db, desktop.ini, ._* di macOS, ~$* di Office, *.tmp, *.swp, .secure_vault).
+func ShouldIgnoreFile(nameOrPath string) bool {
+	base := strings.TrimSpace(filepath.Base(nameOrPath))
+	if base == "" || base == "." || base == "/" {
+		return false
+	}
+	lower := strings.ToLower(base)
+
+	switch lower {
+	case ".ds_store", "thumbs.db", "thumbs.db:encryptable", "ehthumbs.db", "ehthumbs_vista.db",
+		"desktop.ini", ".spotlight-v100", ".trashes", ".fseventsd", ".temporaryitems",
+		"$recycle.bin", "system volume information", ".secure_vault":
+		return true
+	}
+
+	if strings.HasPrefix(base, "._") || strings.HasPrefix(base, "~$") {
+		return true
+	}
+	if strings.HasSuffix(lower, ".tmp") || strings.HasSuffix(lower, ".bak") ||
+		strings.HasSuffix(lower, ".swp") || strings.HasSuffix(lower, ".swo") ||
+		strings.HasSuffix(lower, "~") {
+		return true
+	}
+	return false
+}
+
 func InitOrOpenVault(usbMountPath, password string, createNew bool) (*SecureVault, error) {
 	vaultDir := filepath.Join(usbMountPath, ".secure_vault")
 	blocksDir := filepath.Join(vaultDir, "blocks")
@@ -94,198 +121,6 @@ func InitOrOpenVault(usbMountPath, password string, createNew bool) (*SecureVaul
 	}
 
 	return v, nil
-}
-
-// ImportDir importa ricorsivamente un'intera cartella dal PC dentro targetParentVirtualDir (es. "/"),
-// comprimendo e cifrando ogni file in streaming multi-core a blocchi da 4 MB.
-func (v *SecureVault) ImportDir(localDirPath, targetParentVirtualDir string, onProgress ProgressFunc) (int, error) {
-	localDirPath = filepath.Clean(localDirPath)
-	info, err := os.Stat(localDirPath)
-	if err != nil {
-		return 0, err
-	}
-	if !info.IsDir() {
-		return 0, errors.New("il percorso selezionato non è una cartella")
-	}
-
-	baseFolderName := filepath.Base(localDirPath)
-	rootVirtualDir := normalizePath(filepath.Join(targetParentVirtualDir, baseFolderName))
-
-	// Calcola il totale dei byte da importare per alimentare la barra di avanzamento
-	var totalBytes int64
-	_ = filepath.WalkDir(localDirPath, func(_ string, d os.DirEntry, err error) error {
-		if err == nil && d.Type().IsRegular() {
-			if fi, sErr := d.Info(); sErr == nil {
-				totalBytes += fi.Size()
-			}
-		}
-		return nil
-	})
-
-	var processedBytes int64
-	var importedCount int
-
-	err = filepath.WalkDir(localDirPath, func(currPath string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		relPath, err := filepath.Rel(localDirPath, currPath)
-		if err != nil {
-			return err
-		}
-
-		var targetVirtualPath string
-		if relPath == "." {
-			targetVirtualPath = rootVirtualDir
-		} else {
-			targetVirtualPath = normalizePath(filepath.Join(rootVirtualDir, relPath))
-		}
-
-		if d.IsDir() {
-			v.mu.Lock()
-			if _, exists := v.index.Entries[targetVirtualPath]; !exists && targetVirtualPath != "/" {
-				v.index.Entries[targetVirtualPath] = FileEntry{
-					VirtualPath: targetVirtualPath,
-					IsDir:       true,
-					UpdatedAt:   time.Now(),
-				}
-			}
-			v.mu.Unlock()
-			return nil
-		}
-
-		// Ignora symlink o file speciali di sistema
-		if !d.Type().IsRegular() {
-			return nil
-		}
-
-		fi, err := d.Info()
-		if err != nil {
-			return err
-		}
-
-		inFile, err := os.Open(currPath)
-		if err != nil {
-			return err
-		}
-
-		baseOffset := processedBytes
-		wErr := v.WriteStream(targetVirtualPath, inFile, fi.Size(), func(fileDone, _ int64) {
-			if onProgress != nil {
-				onProgress(baseOffset+fileDone, totalBytes)
-			}
-		})
-		_ = inFile.Close()
-		if wErr != nil {
-			return wErr
-		}
-
-		processedBytes += fi.Size()
-		importedCount++
-		return nil
-	})
-
-	if err != nil {
-		return importedCount, err
-	}
-
-	v.mu.Lock()
-	saveErr := v.saveIndexLocked()
-	v.mu.Unlock()
-	return importedCount, saveErr
-}
-
-// ExportDir esporta ricorsivamente una cartella virtuale dal Vault verso localDestParentDir sul PC.
-func (v *SecureVault) ExportDir(virtualDirPath, localDestParentDir string, onProgress ProgressFunc) (int, error) {
-	virtualDirPath = normalizePath(virtualDirPath)
-	localDestParentDir = filepath.Clean(localDestParentDir)
-
-	folderName := filepath.Base(virtualDirPath)
-	if virtualDirPath == "/" || folderName == "." || folderName == "/" {
-		folderName = "Vault_Export"
-	}
-	targetRootLocal := filepath.Join(localDestParentDir, folderName)
-
-	if err := os.MkdirAll(targetRootLocal, 0700); err != nil {
-		return 0, err
-	}
-
-	prefix := virtualDirPath + "/"
-	if virtualDirPath == "/" {
-		prefix = "/"
-	}
-
-	v.mu.RLock()
-	var items []FileEntry
-	var totalBytes int64
-	for k, entry := range v.index.Entries {
-		if k == virtualDirPath || strings.HasPrefix(k, prefix) {
-			items = append(items, entry)
-			if !entry.IsDir {
-				totalBytes += entry.OriginalSize
-			}
-		}
-	}
-	v.mu.RUnlock()
-
-	// 1. Crea tutte le sottocartelle locali
-	for _, entry := range items {
-		if !entry.IsDir {
-			continue
-		}
-		rel := strings.TrimPrefix(entry.VirtualPath, virtualDirPath)
-		rel = strings.TrimPrefix(rel, "/")
-		if rel == "" {
-			continue
-		}
-		localSubDir := filepath.Join(targetRootLocal, filepath.FromSlash(rel))
-		if err := os.MkdirAll(localSubDir, 0700); err != nil {
-			return 0, err
-		}
-	}
-
-	// 2. Decifra e decomprime in streaming tutti i file
-	var processedBytes int64
-	var exportedCount int
-
-	for _, entry := range items {
-		if entry.IsDir {
-			continue
-		}
-		rel := strings.TrimPrefix(entry.VirtualPath, virtualDirPath)
-		rel = strings.TrimPrefix(rel, "/")
-		localFilePath := filepath.Join(targetRootLocal, filepath.FromSlash(rel))
-
-		if err := os.MkdirAll(filepath.Dir(localFilePath), 0700); err != nil {
-			return exportedCount, err
-		}
-
-		outFile, err := os.OpenFile(localFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-		if err != nil {
-			return exportedCount, err
-		}
-
-		bw := bufio.NewWriterSize(outFile, 1024*1024)
-		baseOffset := processedBytes
-		rErr := v.ReadStream(entry.VirtualPath, bw, func(fileDone, _ int64) {
-			if onProgress != nil {
-				onProgress(baseOffset+fileDone, totalBytes)
-			}
-		})
-		if rErr == nil {
-			rErr = bw.Flush()
-		}
-		_ = outFile.Close()
-		if rErr != nil {
-			return exportedCount, rErr
-		}
-
-		processedBytes += entry.OriginalSize
-		exportedCount++
-	}
-
-	return exportedCount, nil
 }
 
 func (v *SecureVault) Close() {
@@ -434,6 +269,212 @@ func (v *SecureVault) ReadFile(virtualPath string) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// ImportDir importa ricorsivamente una cartella dal PC dentro targetParentVirtualDir,
+// filtrando automaticamente i file temporanei/spazzatura (.DS_Store, Thumbs.db, desktop.ini, ecc.).
+func (v *SecureVault) ImportDir(localDirPath, targetParentVirtualDir string, onProgress ProgressFunc) (int, error) {
+	localDirPath = filepath.Clean(localDirPath)
+	info, err := os.Stat(localDirPath)
+	if err != nil {
+		return 0, err
+	}
+	if !info.IsDir() {
+		return 0, errors.New("il percorso selezionato non è una cartella")
+	}
+
+	baseFolderName := filepath.Base(localDirPath)
+	if ShouldIgnoreFile(baseFolderName) {
+		return 0, nil
+	}
+	rootVirtualDir := normalizePath(filepath.Join(targetParentVirtualDir, baseFolderName))
+
+	var totalBytes int64
+	_ = filepath.WalkDir(localDirPath, func(currPath string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if currPath != localDirPath && ShouldIgnoreFile(d.Name()) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Type().IsRegular() {
+			if fi, sErr := d.Info(); sErr == nil {
+				totalBytes += fi.Size()
+			}
+		}
+		return nil
+	})
+
+	var processedBytes int64
+	var importedCount int
+
+	err = filepath.WalkDir(localDirPath, func(currPath string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if currPath != localDirPath && ShouldIgnoreFile(d.Name()) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		relPath, err := filepath.Rel(localDirPath, currPath)
+		if err != nil {
+			return err
+		}
+
+		var targetVirtualPath string
+		if relPath == "." {
+			targetVirtualPath = rootVirtualDir
+		} else {
+			targetVirtualPath = normalizePath(filepath.Join(rootVirtualDir, relPath))
+		}
+
+		if d.IsDir() {
+			v.mu.Lock()
+			if _, exists := v.index.Entries[targetVirtualPath]; !exists && targetVirtualPath != "/" {
+				v.index.Entries[targetVirtualPath] = FileEntry{
+					VirtualPath: targetVirtualPath,
+					IsDir:       true,
+					UpdatedAt:   time.Now(),
+				}
+			}
+			v.mu.Unlock()
+			return nil
+		}
+
+		if !d.Type().IsRegular() {
+			return nil
+		}
+
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		inFile, err := os.Open(currPath)
+		if err != nil {
+			return err
+		}
+
+		baseOffset := processedBytes
+		wErr := v.WriteStream(targetVirtualPath, inFile, fi.Size(), func(fileDone, _ int64) {
+			if onProgress != nil {
+				onProgress(baseOffset+fileDone, totalBytes)
+			}
+		})
+		_ = inFile.Close()
+		if wErr != nil {
+			return wErr
+		}
+
+		processedBytes += fi.Size()
+		importedCount++
+		return nil
+	})
+
+	if err != nil {
+		return importedCount, err
+	}
+
+	v.mu.Lock()
+	saveErr := v.saveIndexLocked()
+	v.mu.Unlock()
+	return importedCount, saveErr
+}
+
+// ExportDir esporta ricorsivamente una cartella virtuale dal Vault verso localDestParentDir sul PC.
+func (v *SecureVault) ExportDir(virtualDirPath, localDestParentDir string, onProgress ProgressFunc) (int, error) {
+	virtualDirPath = normalizePath(virtualDirPath)
+	localDestParentDir = filepath.Clean(localDestParentDir)
+
+	folderName := filepath.Base(virtualDirPath)
+	if virtualDirPath == "/" || folderName == "." || folderName == "/" {
+		folderName = "Vault_Export"
+	}
+	targetRootLocal := filepath.Join(localDestParentDir, folderName)
+
+	if err := os.MkdirAll(targetRootLocal, 0700); err != nil {
+		return 0, err
+	}
+
+	prefix := virtualDirPath + "/"
+	if virtualDirPath == "/" {
+		prefix = "/"
+	}
+
+	v.mu.RLock()
+	var items []FileEntry
+	var totalBytes int64
+	for k, entry := range v.index.Entries {
+		if k == virtualDirPath || strings.HasPrefix(k, prefix) {
+			items = append(items, entry)
+			if !entry.IsDir {
+				totalBytes += entry.OriginalSize
+			}
+		}
+	}
+	v.mu.RUnlock()
+
+	for _, entry := range items {
+		if !entry.IsDir {
+			continue
+		}
+		rel := strings.TrimPrefix(entry.VirtualPath, virtualDirPath)
+		rel = strings.TrimPrefix(rel, "/")
+		if rel == "" {
+			continue
+		}
+		localSubDir := filepath.Join(targetRootLocal, filepath.FromSlash(rel))
+		if err := os.MkdirAll(localSubDir, 0700); err != nil {
+			return 0, err
+		}
+	}
+
+	var processedBytes int64
+	var exportedCount int
+
+	for _, entry := range items {
+		if entry.IsDir {
+			continue
+		}
+		rel := strings.TrimPrefix(entry.VirtualPath, virtualDirPath)
+		rel = strings.TrimPrefix(rel, "/")
+		localFilePath := filepath.Join(targetRootLocal, filepath.FromSlash(rel))
+
+		if err := os.MkdirAll(filepath.Dir(localFilePath), 0700); err != nil {
+			return exportedCount, err
+		}
+
+		outFile, err := os.OpenFile(localFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			return exportedCount, err
+		}
+
+		bw := bufio.NewWriterSize(outFile, 1024*1024)
+		baseOffset := processedBytes
+		rErr := v.ReadStream(entry.VirtualPath, bw, func(fileDone, _ int64) {
+			if onProgress != nil {
+				onProgress(baseOffset+fileDone, totalBytes)
+			}
+		})
+		if rErr == nil {
+			rErr = bw.Flush()
+		}
+		_ = outFile.Close()
+		if rErr != nil {
+			return exportedCount, rErr
+		}
+
+		processedBytes += entry.OriginalSize
+		exportedCount++
+	}
+
+	return exportedCount, nil
 }
 
 func (v *SecureVault) saveIndexLocked() error {

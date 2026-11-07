@@ -15,7 +15,6 @@ fn test_rayon_parallel_multichunk_and_tamper_integration() {
     let dir = tempdir().unwrap();
     let vault = SecureVault::init_or_open(dir.path(), "Rust-Master-Key-2026!", true).unwrap();
 
-    // 9.5 MB (attraversa 3 chunk da 4 MB)
     let size = 2 * CHUNK_SIZE + (CHUNK_SIZE / 3);
     let mut payload = vec![0u8; size];
     for i in 0..(size / 2) {
@@ -31,7 +30,6 @@ fn test_rayon_parallel_multichunk_and_tamper_integration() {
     let decrypted = vault.read_file("/video/4k_sample.bin").unwrap();
     assert_eq!(payload, decrypted);
 
-    // Verifica rilevamento manomissione (Bit-Flip sul primo chunk)
     let blob_path = dir
         .path()
         .join(".secure_vault")
@@ -47,7 +45,6 @@ fn test_rayon_parallel_multichunk_and_tamper_integration() {
         "Poly1305 deve bloccare qualsiasi bit-flip"
     );
 
-    // Verifica rilevamento troncamento (rimozione ultimo chunk con flag EOF)
     let first_chunk_end = HEADER_SIZE + 4 + (stat.chunk_sizes[0] as usize);
     fs::write(&blob_path, &raw_disk[..first_chunk_end]).unwrap();
     assert!(
@@ -57,7 +54,86 @@ fn test_rayon_parallel_multichunk_and_tamper_integration() {
 }
 
 // ============================================================================
-// 2. END-TO-END (E2E) TEST: Ciclo completo + Seeker O(1) + HTTP 206 Range
+// 2. INTEGRATION TEST: import_dir & export_dir Ricorsivi + Esclusione Junk Files
+// ============================================================================
+
+#[test]
+fn test_import_and_export_dir_recursive_with_junk_filter_integration() {
+    let vault_dir = tempdir().unwrap();
+    let src_parent = tempdir().unwrap();
+    let export_parent = tempdir().unwrap();
+
+    let project_root = src_parent.path().join("WorkspaceSicuro");
+    let sub_src = project_root.join("src").join("crypto");
+    let sub_docs = project_root.join("docs");
+    let junk_folder = project_root.join(".Trashes");
+
+    fs::create_dir_all(&sub_src).unwrap();
+    fs::create_dir_all(&sub_docs).unwrap();
+    fs::create_dir_all(&junk_folder).unwrap();
+
+    // 3 file validi
+    let f1_content = b"# Workspace Sicuro Rust\n".repeat(100);
+    let f2_content = b"pub fn aead_simd() {}\n".repeat(2000);
+    let f3_content = b"%PDF-1.7 documento riservato";
+
+    fs::write(project_root.join("README.md"), &f1_content).unwrap();
+    fs::write(sub_src.join("lib.rs"), &f2_content).unwrap();
+    fs::write(sub_docs.join("architettura.pdf"), f3_content).unwrap();
+
+    // File temporanei / spazzatura di sistema che DEVONO essere ignorati
+    fs::write(project_root.join(".DS_Store"), b"macos junk").unwrap();
+    fs::write(project_root.join("Thumbs.db"), b"windows junk").unwrap();
+    fs::write(sub_src.join("desktop.ini"), b"ini junk").unwrap();
+    fs::write(sub_src.join("._lib.rs"), b"appledouble junk").unwrap();
+    fs::write(sub_docs.join("~$architettura.pdf"), b"office lock").unwrap();
+    fs::write(sub_docs.join("temp_swap.tmp"), b"tmp file").unwrap();
+    fs::write(junk_folder.join("deleted.bin"), b"trash content").unwrap();
+
+    let vault = SecureVault::init_or_open(vault_dir.path(), "FolderKey2026!", true).unwrap();
+    vault.create_dir("/Backup").unwrap();
+
+    // 1. Importazione ricorsiva
+    let imported_count = vault.import_dir(&project_root, "/Backup").unwrap();
+    assert_eq!(imported_count, 3, "Devono essere importati solo i 3 file validi");
+
+    // Verifica assenza dei file temporanei nell'indice
+    for forbidden in [
+        "/Backup/WorkspaceSicuro/.DS_Store",
+        "/Backup/WorkspaceSicuro/Thumbs.db",
+        "/Backup/WorkspaceSicuro/src/crypto/desktop.ini",
+        "/Backup/WorkspaceSicuro/src/crypto/._lib.rs",
+        "/Backup/WorkspaceSicuro/docs/~$architettura.pdf",
+        "/Backup/WorkspaceSicuro/docs/temp_swap.tmp",
+        "/Backup/WorkspaceSicuro/.Trashes/deleted.bin",
+    ] {
+        assert!(
+            vault.stat(forbidden).is_none(),
+            "Il file spazzatura {forbidden} non doveva essere importato"
+        );
+    }
+
+    // 2. Esportazione ricorsiva
+    let exported_count = vault
+        .export_dir("/Backup/WorkspaceSicuro", export_parent.path())
+        .unwrap();
+    assert_eq!(exported_count, 3);
+
+    // 3. Verifica byte-per-byte dei file esportati
+    let exp_root = export_parent.path().join("WorkspaceSicuro");
+    assert_eq!(fs::read(exp_root.join("README.md")).unwrap(), f1_content);
+    assert_eq!(
+        fs::read(exp_root.join("src").join("crypto").join("lib.rs")).unwrap(),
+        f2_content
+    );
+    assert_eq!(
+        fs::read(exp_root.join("docs").join("architettura.pdf")).unwrap(),
+        f3_content
+    );
+}
+
+// ============================================================================
+// 3. END-TO-END (E2E) TEST: Ciclo completo + Seeker O(1) + HTTP 206 Range
 // ============================================================================
 
 #[test]
@@ -68,7 +144,6 @@ fn test_full_lifecycle_seeker_and_http_range_e2e() {
     let v1 = SecureVault::init_or_open(dir.path(), pass, true).unwrap();
     v1.create_dir("/Cinema").unwrap();
 
-    // 8.5 MB (3 chunk)
     let mut movie = vec![0u8; 2 * CHUNK_SIZE + 512 * 1024];
     for (i, b) in movie.iter_mut().enumerate() {
         *b = ((i * 17) & 0xFF) as u8;
@@ -76,21 +151,17 @@ fn test_full_lifecycle_seeker_and_http_range_e2e() {
     v1.write_file("/Cinema/matrix.mp4", &movie).unwrap();
     drop(v1);
 
-    // Password errata deve fallire
     assert!(SecureVault::init_or_open(dir.path(), "PasswordErrata", false).is_err());
 
-    // Riapertura con password corretta
     let v2 = SecureVault::init_or_open(dir.path(), pass, false).unwrap();
     let mut seeker = v2.open_read_seeker("/Cinema/matrix.mp4").unwrap();
 
-    // Seek esattamente a cavallo del confine dei 4 MB tra chunk 0 e chunk 1
     let boundary = (CHUNK_SIZE - 256) as u64;
     seeker.seek(SeekFrom::Start(boundary)).unwrap();
     let mut window = vec![0u8; 1024];
     seeker.read_exact(&mut window).unwrap();
     assert_eq!(&window[..], &movie[boundary as usize..(boundary as usize) + 1024]);
 
-    // Test Server HTTP di Streaming con header Range
     let stream_url = v2.get_stream_url("/Cinema/matrix.mp4").unwrap();
     let without_proto = stream_url.strip_prefix("http://").unwrap();
     let (host_port, req_path) = without_proto.split_once('/').unwrap();
@@ -121,7 +192,7 @@ fn test_full_lifecycle_seeker_and_http_range_e2e() {
 }
 
 // ============================================================================
-// 3. PROPERTY & FUZZ TESTING (Proptest: Round-Trip + Random-Access ReadAt)
+// 4. PROPERTY & FUZZ TESTING (Proptest: Round-Trip + Random-Access ReadAt)
 // ============================================================================
 
 proptest! {

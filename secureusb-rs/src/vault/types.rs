@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const SALT_SIZE: usize = 16;
@@ -15,6 +16,42 @@ pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB
 pub const MAX_COMPRESSED_CHUNK: usize = CHUNK_SIZE + (CHUNK_SIZE / 8) + 65536;
 pub const MAX_TEXT_PREVIEW_SIZE: u64 = 16 * 1024 * 1024;
 pub const VAULT_STREAM_MAGIC: &[u8; 8] = b"SVAULT03";
+
+/// Restituisce true se il nome o percorso corrisponde a un file temporaneo o di sistema da escludere.
+pub fn should_ignore_entry(name_or_path: impl AsRef<Path>) -> bool {
+    let Some(os_name) = name_or_path.as_ref().file_name() else {
+        return false;
+    };
+    let base = os_name.to_string_lossy();
+    let trimmed = base.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == "/" {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    matches!(
+        lower.as_str(),
+        ".ds_store"
+            | "thumbs.db"
+            | "thumbs.db:encryptable"
+            | "ehthumbs.db"
+            | "ehthumbs_vista.db"
+            | "desktop.ini"
+            | ".spotlight-v100"
+            | ".trashes"
+            | ".fseventsd"
+            | ".temporaryitems"
+            | "$recycle.bin"
+            | "system volume information"
+            | ".secure_vault"
+    ) || trimmed.starts_with("._")
+        || trimmed.starts_with("~$")
+        || lower.ends_with(".tmp")
+        || lower.ends_with(".bak")
+        || lower.ends_with(".swp")
+        || lower.ends_with(".swo")
+        || lower.ends_with('~')
+}
 
 /// MasterKey a 256-bit protetta da ZeroizeOnDrop e ancorata nella RAM fisica con mlock.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -47,10 +84,7 @@ impl MasterKey {
     #[cfg(unix)]
     fn lock_memory(&self) {
         unsafe {
-            let _ = libc::mlock(
-                self.bytes.as_ptr() as *const libc::c_void,
-                KEY_SIZE,
-            );
+            let _ = libc::mlock(self.bytes.as_ptr() as *const libc::c_void, KEY_SIZE);
         }
     }
 
@@ -75,7 +109,6 @@ pub struct VaultIndex {
     pub entries: HashMap<String, FileEntry>,
 }
 
-/// Costruisce il Nonce (24B) e l'AAD (17B) legando ogni chunk al suo indice a 64-bit e al flag EOF.
 #[inline]
 pub fn build_chunk_nonce_and_aad(
     stream_id: &[u8; STREAM_ID_SIZE],
@@ -139,5 +172,28 @@ mod tests {
         assert_eq!(normalize_path("video/clip.mp4"), "/video/clip.mp4");
         assert_eq!(normalize_path("/a/b/../c.bin"), "/a/c.bin");
         assert_eq!(normalize_path(""), "/");
+    }
+
+    #[test]
+    fn test_should_ignore_entry_unit() {
+        for junk in [
+            ".DS_Store",
+            "/tmp/.ds_store",
+            "Thumbs.db",
+            "desktop.ini",
+            "._image.png",
+            "~$report.docx",
+            "partial.tmp",
+            "old.bak",
+            ".vim.swp",
+            ".Spotlight-V100",
+            ".secure_vault",
+        ] {
+            assert!(should_ignore_entry(junk), "Atteso ignore=true per {junk}");
+        }
+
+        for valid in ["documento.pdf", "main.rs", "video.mkv", ".gitignore"] {
+            assert!(!should_ignore_entry(valid), "Atteso ignore=false per {valid}");
+        }
     }
 }

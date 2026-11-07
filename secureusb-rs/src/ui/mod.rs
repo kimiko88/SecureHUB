@@ -1,7 +1,7 @@
 pub mod preview;
 
 use crate::usb::format_physical_usb;
-use crate::vault::{FileEntry, SecureVault, MAX_TEXT_PREVIEW_SIZE};
+use crate::vault::{should_ignore_entry, FileEntry, SecureVault, MAX_TEXT_PREVIEW_SIZE};
 use eframe::egui;
 use std::fs::File;
 use std::io::BufWriter;
@@ -10,11 +10,13 @@ use std::sync::Arc;
 
 pub fn run_app() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 720.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 720.0])
+            .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(
-        "SecureUSB Explorer (Rust) — Zeroize + Rayon Multi-Core + SIMD In-Place AEAD",
+        "SecureUSB Explorer (Rust) — Zeroize + Rayon + SIMD + Drag & Drop",
         options,
         Box::new(|_cc| Ok(Box::new(SecureUsbApp::default()))),
     )
@@ -52,6 +54,7 @@ struct SecureUsbApp {
     current_dir: String,
     entries: Vec<FileEntry>,
     selected_path: Option<String>,
+    selected_is_dir: bool,
     preview: PreviewState,
     new_item_name: String,
 }
@@ -67,15 +70,16 @@ impl SecureUsbApp {
     }
 
     fn select_entry(&mut self, ctx: &egui::Context, entry: &FileEntry) {
+        self.selected_path = Some(entry.virtual_path.clone());
+        self.selected_is_dir = entry.is_dir;
+
         if entry.is_dir {
             self.current_dir = entry.virtual_path.clone();
-            self.selected_path = None;
             self.preview = PreviewState::None;
             self.refresh_dir();
             return;
         }
 
-        self.selected_path = Some(entry.virtual_path.clone());
         let Some(v) = &self.vault else { return };
 
         if preview::is_image_ext(&entry.virtual_path) {
@@ -124,13 +128,79 @@ impl SecureUsbApp {
             }
         }
     }
+
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+
+        // Se siamo nella schermata di sblocco, imposta la cartella trascinata come percorso USB
+        if self.vault.is_none() {
+            if let Some(first_path) = dropped.first().and_then(|d| d.path.as_ref()) {
+                self.usb_path = first_path.display().to_string();
+            }
+            return;
+        }
+
+        let Some(v) = self.vault.clone() else { return };
+        let cur_dir = if self.current_dir.is_empty() {
+            "/".to_string()
+        } else {
+            self.current_dir.clone()
+        };
+
+        let mut total_imported = 0usize;
+        for df in dropped {
+            let Some(path) = df.path else { continue };
+            if should_ignore_entry(&path) {
+                continue;
+            }
+            if path.is_dir() {
+                match v.import_dir(&path, &cur_dir) {
+                    Ok(cnt) => total_imported += cnt,
+                    Err(e) => self.status_msg = format!("Errore Drag & Drop cartella: {e}"),
+                }
+            } else if path.is_file() {
+                if let Ok(f) = File::open(&path) {
+                    let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                    let target = format!("{cur_dir}/{fname}");
+                    match v.write_stream(&target, f) {
+                        Ok(()) => total_imported += 1,
+                        Err(e) => self.status_msg = format!("Errore Drag & Drop file: {e}"),
+                    }
+                }
+            }
+        }
+
+        self.status_msg = format!(
+            "Drag & Drop completato: {total_imported} file cifrati in '{cur_dir}' (file temporanei esclusi)!"
+        );
+        self.refresh_dir();
+    }
 }
 
 impl eframe::App for SecureUsbApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 1. Elabora eventuali file/cartelle rilasciati con Drag & Drop
+        self.handle_dropped_files(ctx);
+
+        // 2. Mostra un overlay visivo quando l'utente trascina file sopra la finestra
+        let is_hovering_files = !ctx.input(|i| i.raw.hovered_files.is_empty());
+        if is_hovering_files {
+            egui::Area::new(egui::Id::new("drag_drop_banner"))
+                .fixed_pos(egui::pos2(300.0, 260.0))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.heading("📥 Rilascia qui file o cartelle per importarli in SVAULT03");
+                        ui.label("I file temporanei (.DS_Store, Thumbs.db, desktop.ini, *.tmp) verranno esclusi automaticamente.");
+                    });
+                });
+        }
+
         if self.vault.is_none() {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("Sblocco e Gestione Chiavetta Cifrata (Rust SVAULT03)");
+                ui.heading("Sblocco e Gestione Chiavetta Cifrata (Rust SVAULT03 — Drag & Drop Attivo)");
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
@@ -188,7 +258,7 @@ impl eframe::App for SecureUsbApp {
 
                 if !self.status_msg.is_empty() {
                     ui.add_space(10.0);
-                    ui.colored_label(egui::Color32::LIGHT_RED, &self.status_msg);
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, &self.status_msg);
                 }
             });
             return;
@@ -223,15 +293,17 @@ impl eframe::App for SecureUsbApp {
                     }
                 }
 
-                if ui.button("📥 Importa (Rayon Multi-Core)").clicked() {
+                if ui.button("📥 Importa File").clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        if let (Some(v), Ok(f)) = (self.vault.clone(), File::open(&path)) {
-                            let fname = path.file_name().unwrap_or_default().to_string_lossy();
-                            let target = format!("{}/{}", self.current_dir, fname);
-                            if let Err(e) = v.write_stream(&target, f) {
-                                self.status_msg = format!("Errore import: {e}");
+                        if !should_ignore_entry(&path) {
+                            if let (Some(v), Ok(f)) = (self.vault.clone(), File::open(&path)) {
+                                let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                                let target = format!("{}/{}", self.current_dir, fname);
+                                if let Err(e) = v.write_stream(&target, f) {
+                                    self.status_msg = format!("Errore import: {e}");
+                                }
+                                self.refresh_dir();
                             }
-                            self.refresh_dir();
                         }
                     }
                 }
@@ -241,7 +313,7 @@ impl eframe::App for SecureUsbApp {
                         if let Some(v) = self.vault.clone() {
                             match v.import_dir(&folder, &self.current_dir) {
                                 Ok(count) => {
-                                    self.status_msg = format!("Importati {count} file dalla cartella!");
+                                    self.status_msg = format!("Importati {count} file dalla cartella (file spazzatura esclusi)!");
                                     self.refresh_dir();
                                 }
                                 Err(e) => self.status_msg = format!("Errore import cartella: {e}"),
@@ -250,7 +322,7 @@ impl eframe::App for SecureUsbApp {
                     }
                 }
 
-                if ui.button("▶ Stream Video al Volo (O(1) Seek)").clicked() {
+                if ui.button("▶ Stream Video (O(1) Seek)").clicked() {
                     if let (Some(v), Some(sel)) = (&self.vault, &self.selected_path) {
                         if let Ok(url) = v.get_stream_url(sel) {
                             let _ = open::that(url);
@@ -258,24 +330,30 @@ impl eframe::App for SecureUsbApp {
                     }
                 }
 
-                if ui.button("📤 Esporta").clicked() {
+                if ui.button("📤 Esporta File").clicked() {
                     if let (Some(v), Some(sel)) = (&self.vault, &self.selected_path) {
-                        if let Some(dest) = rfd::FileDialog::new().save_file() {
-                            if let Ok(out) = File::create(dest) {
-                                let _ = v.read_stream(sel, BufWriter::new(out));
+                        if !self.selected_is_dir {
+                            if let Some(dest) = rfd::FileDialog::new().save_file() {
+                                if let Ok(out) = File::create(dest) {
+                                    let _ = v.read_stream(sel, BufWriter::new(out));
+                                }
                             }
                         }
                     }
                 }
 
-                                if ui.button("📁📤 Esporta Cartella").clicked() {
+                if ui.button("📁📤 Esporta Cartella").clicked() {
                     if let Some(dest_folder) = rfd::FileDialog::new().pick_folder() {
                         if let Some(v) = self.vault.clone() {
-                            match v.export_dir(&self.current_dir, &dest_folder) {
+                            let target_dir = if self.selected_is_dir {
+                                self.selected_path.clone().unwrap_or_else(|| self.current_dir.clone())
+                            } else {
+                                self.current_dir.clone()
+                            };
+                            match v.export_dir(&target_dir, &dest_folder) {
                                 Ok(count) => {
                                     self.status_msg = format!(
-                                        "Esportati {count} file da '{}' in '{}'!",
-                                        self.current_dir,
+                                        "Esportati {count} file da '{target_dir}' in '{}'!",
                                         dest_folder.display()
                                     );
                                 }
@@ -300,7 +378,12 @@ impl eframe::App for SecureUsbApp {
                     self.preview = PreviewState::None;
                 }
             });
-            ui.label(format!("Percorso attivo: {}", self.current_dir));
+            ui.horizontal(|ui| {
+                ui.label(format!("Percorso attivo: {}  |  [Trascina file o cartelle nella finestra per importarli]", self.current_dir));
+                if !self.status_msg.is_empty() {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, &self.status_msg);
+                }
+            });
         });
 
         egui::SidePanel::left("file_list")
@@ -327,12 +410,11 @@ impl eframe::App for SecureUsbApp {
                 });
             });
 
-        // Buffer per differire il salvataggio ed evitare il conflitto di prestito su self
         let mut save_target: Option<(String, Vec<u8>)> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.preview {
             PreviewState::None => {
-                ui.label("Seleziona un file dalla lista per visualizzarlo o modificarlo in RAM.");
+                ui.label("Seleziona un file dalla lista o trascina file/cartelle dal tuo computer dentro questa finestra.");
             }
             PreviewState::Text { path, content } => {
                 ui.horizontal(|ui| {
@@ -395,11 +477,10 @@ impl eframe::App for SecureUsbApp {
                 ui.label(format!(
                     "Dimensione: {size} byte suddivisi in {chunks} chunk indipendenti da 4 MB."
                 ));
-                ui.label("Usa 'Stream Video al Volo (O(1) Seek)' nella barra in alto per riprodurlo istantaneamente.");
+                ui.label("Usa 'Stream Video (O(1) Seek)' nella barra in alto per riprodurlo istantaneamente.");
             }
         });
 
-        // Esegue il salvataggio e il refresh quando self.preview non è più preso in prestito
         if let Some((path, data)) = save_target {
             if let Some(v) = &self.vault {
                 let _ = v.write_file(&path, &data);

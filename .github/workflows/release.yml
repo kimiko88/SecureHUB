@@ -56,6 +56,15 @@ jobs:
         working-directory: secureusb-rs
         run: |
           cargo bench --bench vault_bench -- --quick
+      - name: Verify WinFsp headers (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          test -f "/c/Program Files (x86)/WinFsp/inc/fuse/fuse_common.h" || {
+            echo "Header WinFsp mancanti"
+            exit 1
+          }
+          gcc --version
 
   # ==========================================================================
   # 2. MATRICE DI COMPILAZIONE CROSS-PLATFORM (LINUX, WINDOWS, MACOS) — GO & RUST
@@ -97,15 +106,25 @@ jobs:
       - name: Install Windows Dependencies (WinFsp + Developer C Headers)
         if: runner.os == 'Windows'
         shell: bash
+        env:
+          CGO_ENABLED: "1"
+          CPATH: "C:\\Program Files (x86)\\WinFsp\\inc\\fuse"
         run: |
-          choco install winfsp -y --install-arguments="ADDLOCAL=ALL" || true
-          if [ ! -f "/c/Program Files (x86)/WinFsp/inc/fuse/fuse_common.h" ]; then
-            echo "Scaricamento header C di WinFsp (fuse_common.h, fuse.h)..."
-            git clone --depth 1 https://github.com/winfsp/winfsp.git /tmp/winfsp_src
-            mkdir -p "/c/Program Files (x86)/WinFsp/inc"
-            cp -r /tmp/winfsp_src/inc/* "/c/Program Files (x86)/WinFsp/inc/"
+          mkdir -p dist
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            go mod tidy
+            go build -ldflags="-s -w -H=windowsgui" -o "dist/${{ matrix.go_bin }}" .
+
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            export CGO_CFLAGS="-I/usr/local/include/fuse -D_FILE_OFFSET_BITS=64"
+            go mod tidy
+            go build -ldflags="-s -w" -o "dist/${{ matrix.go_bin }}" .
+
+          else
+            go mod tidy
+            go build -ldflags="-s -w" -o "dist/${{ matrix.go_bin }}" .
           fi
-          ls -la "/c/Program Files (x86)/WinFsp/inc/fuse"
 
       - name: Install macOS Dependencies (FUSE C Headers for cgofuse)
         if: runner.os == 'macOS'

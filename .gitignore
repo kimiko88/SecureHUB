@@ -1,0 +1,112 @@
+# ==============================================================================
+# SECUREUSB / SECUREHUB — ROOT .GITIGNORE (Go + Rust Multi-Platform Architecture)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. ARTEFATTI DI BUILD & RELEASE (Go & Rust)
+# ------------------------------------------------------------------------------
+/dist/
+/release-assets/
+/build/
+/bin/
+
+# Specific compiled binary names (avoiding broad wildcards that match folders)
+*.exe~
+*.dll
+*.pyd
+*.lib
+*.pdb
+*.exp
+*.so
+*.dylib
+*.a
+
+# Go specific build outputs in root
+/secureusb
+/secureusb-linux*
+/secureusb-mac*
+
+# ------------------------------------------------------------------------------
+# 2. RUST / CARGO SPECIFICS (Workspace & Sottocartelle)
+# ------------------------------------------------------------------------------
+**/target/
+target/
+secureusb-rs/target/
+
+# Backup and temporary files
+**/*.rs.bk
+*.rs.bk
+Cargo.lock.orig
+
+# ------------------------------------------------------------------------------
+# 3. FUZZING & BENCHMARKING (Go Native Fuzz + cargo-fuzz / libFuzzer + Criterion)
+# ------------------------------------------------------------------------------
+**/fuzz/artifacts/
+fuzz/artifacts/
+fuzz_crash_*
+crash-*
+leak-*
+timeout-*
+oom-*
+**/fuzz/corpus/
+fuzz/corpus/
+testdata/fuzz/
+**/target/criterion/
+
+# ------------------------------------------------------------------------------
+# 4. GO SPECIFICS (Test, Coverage & Moduli)
+# ------------------------------------------------------------------------------
+*.test
+*.out
+cover.out
+coverage.html
+profile.pprof
+cpu.pprof
+mem.pprof
+
+# ------------------------------------------------------------------------------
+# 5. TEST VAULT & DISCHI VIRTUALI
+# ------------------------------------------------------------------------------
+.secure_vault/
+**/.secure_vault/
+*.tmp
+*.tmp.*
+*.bin.tmp*
+/mnt/secureusb*
+/tmp/secureusb_mount*
+
+# ------------------------------------------------------------------------------
+# 6. IDE, EDITOR & TOOLCHAIN
+# ------------------------------------------------------------------------------
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.code-workspace
+
+.idea/
+*.iws
+*.iml
+*.ipr
+
+.*.swp
+.*.swo
+*~
+*.bak
+*.gch
+
+# ------------------------------------------------------------------------------
+# 7. SISTEMA OPERATIVO
+# ------------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/

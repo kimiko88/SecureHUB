@@ -1,0 +1,164 @@
+name: SecureUSB CI/CD — Build & Test (Go + Rust)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+permissions:
+  contents: write
+
+jobs:
+  # ==========================================================================
+  # 1. SUITE DI TEST, RACE DETECTOR, FUZZING BREVE E BENCHMARK (GO + RUST)
+  # ==========================================================================
+  verify-and-test:
+    name: Test, Fuzz & Bench (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies (FUSE, OpenGL, X11, exFAT)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev xorg-dev libfuse-dev exfatprogs pkg-config
+
+      - name: Setup Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Setup Rust Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Go Unit, Integration & E2E Tests (with Race Detector)
+        run: |
+          go mod tidy
+          go test -v -race ./internal/vault/...
+
+      - name: Run Go Native Fuzzing (10s Smoke Fuzz)
+        run: |
+          go test -fuzz=FuzzVaultRoundTripAndSeeker -fuzztime=10s ./internal/vault
+
+      - name: Run Go Benchmarks
+        run: |
+          go test -bench=. -benchmem -run=^$ ./internal/vault
+
+      - name: Run Rust Unit, Integration, E2E & Proptest Fuzz Suite
+        working-directory: secureusb-rs
+        run: |
+          cargo test --release -- --nocapture
+
+      - name: Verify Rust Criterion Benchmarks Compile & Execute
+        working-directory: secureusb-rs
+        run: |
+          cargo bench --bench vault_bench -- --quick
+
+  # ==========================================================================
+  # 2. MATRICE DI COMPILAZIONE CROSS-PLATFORM (LINUX, WINDOWS, MACOS) — GO & RUST
+  # ==========================================================================
+  build-matrix:
+    name: Build (${{ matrix.os_name }} — Go & Rust)
+    needs: verify-and-test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_name: linux-amd64
+            go_bin: secureusb-go-linux-amd64
+            rust_bin: secureusb-rs-linux-amd64
+            ext: ""
+          - os: windows-latest
+            os_name: windows-amd64
+            go_bin: SecureUSB-Go-Windows-amd64.exe
+            rust_bin: SecureUSB-Rust-Windows-amd64.exe
+            ext: ".exe"
+          - os: macos-latest
+            os_name: macos-universal
+            go_bin: secureusb-go-macos
+            rust_bin: secureusb-rs-macos
+            ext: ""
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux Dependencies (FUSE & X11/OpenGL)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev xorg-dev libfuse-dev pkg-config
+
+      - name: Install macOS Dependencies (macFUSE headers)
+        if: runner.os == 'macOS'
+        run: |
+          brew install --cask macfuse || true
+
+      - name: Install Windows Dependencies (WinFsp)
+        if: runner.os == 'Windows'
+        run: |
+          choco install winfsp -y || true
+
+      - name: Setup Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Go Executable (${{ matrix.os_name }})
+        shell: bash
+        run: |
+          go mod tidy
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            go build -ldflags="-s -w -H=windowsgui" -o "dist/${{ matrix.go_bin }}" .
+          else
+            go build -ldflags="-s -w" -o "dist/${{ matrix.go_bin }}" .
+          fi
+
+      - name: Build Rust Executable with SIMD + LTO (${{ matrix.os_name }})
+        shell: bash
+        run: |
+          cd secureusb-rs
+          cargo build --release
+          mkdir -p ../dist
+          cp "target/release/secureusb-rs${{ matrix.ext }}" "../dist/${{ matrix.rust_bin }}"
+
+      - name: Upload Artifacts (${{ matrix.os_name }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.os_name }}
+          path: dist/*
+
+  # ==========================================================================
+  # 3. PUBBLICAZIONE AUTOMATICA SU GITHUB RELEASES (SU TAG v*)
+  # ==========================================================================
+  publish-release:
+    name: Publish GitHub Release (6 Executables)
+    needs: build-matrix
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Built Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 Checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

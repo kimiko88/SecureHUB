@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	fusemount "secureusb/internal/fuse"
 	"secureusb/internal/usb"
@@ -25,25 +26,99 @@ import (
 
 func Run() {
 	a := app.NewWithID("it.secureusb.explorer.v3")
-	w := a.NewWindow(fmt.Sprintf("SecureUSB Explorer — SVAULT03 (%d Core) + Drag&Drop + FUSE/WinFsp", runtime.NumCPU()))
-	w.Resize(fyne.NewSize(1220, 720))
+	a.Settings().SetTheme(NewSecureCyberTheme())
+
+	w := a.NewWindow(fmt.Sprintf("🔐 SecureUSB Explorer — SVAULT03 (%d Core) • Auto-USB • KeyWrap • Zero-Temp", runtime.NumCPU()))
+	w.Resize(fyne.NewSize(1280, 760))
 
 	showUnlockScreen(w)
 	w.ShowAndRun()
 }
 
 func showUnlockScreen(w fyne.Window) {
-	usbPathEntry := widget.NewEntry()
-	usbPathEntry.SetPlaceHolder("Percorso della chiavetta montata (oppure trascina qui la cartella della USB)")
+	stopWatcher := make(chan struct{})
+	stopped := false
+	stopHotplug := func() {
+		if !stopped {
+			stopped = true
+			close(stopWatcher)
+		}
+	}
 
-	// Drag & Drop sulla schermata di sblocco: imposta automaticamente il percorso della USB
+	usbPathEntry := widget.NewEntry()
+	usbPathEntry.SetPlaceHolder("Percorso della chiavetta USB (selezionala dal menu sopra o trascinala qui)")
+
 	w.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
 		if len(uris) > 0 {
 			usbPathEntry.SetText(uris[0].Path())
 		}
 	})
 
-	browseBtn := widget.NewButtonWithIcon("Sfoglia Cartella USB", theme.FolderOpenIcon(), func() {
+	driveMap := make(map[string]string)
+	usbSelect := widget.NewSelect([]string{}, func(selectedLabel string) {
+		if mp, ok := driveMap[selectedLabel]; ok {
+			usbPathEntry.SetText(mp)
+		}
+	})
+	usbSelect.PlaceHolder = "🔌 Rilevamento automatico chiavette USB in corso..."
+
+	usbStatusBadge := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+
+	refreshDrives := func() {
+		drives := usb.DetectUSBDrives()
+		var options []string
+		driveMap = make(map[string]string)
+		vaultFound := 0
+
+		for _, d := range drives {
+			options = append(options, d.Label)
+			driveMap[d.Label] = d.MountPath
+			if d.HasVault {
+				vaultFound++
+			}
+		}
+
+		usbSelect.Options = options
+		usbSelect.Refresh()
+
+		if len(drives) == 0 {
+			usbStatusBadge.SetText("⚠️ Nessuna unità esterna rilevata — Inserisci una chiavetta USB o sfoglia manualmente")
+		} else if vaultFound > 0 {
+			usbStatusBadge.SetText(fmt.Sprintf("✅ %d unità USB rilevate (%d con Vault SVAULT03 pronto allo sblocco!)", len(drives), vaultFound))
+			if strings.TrimSpace(usbPathEntry.Text) == "" {
+				usbSelect.SetSelected(options[0])
+			}
+		} else {
+			usbStatusBadge.SetText(fmt.Sprintf("💾 %d unità USB rilevate — Selezionane una per inizializzare un nuovo Vault", len(drives)))
+			if strings.TrimSpace(usbPathEntry.Text) == "" {
+				usbSelect.SetSelected(options[0])
+			}
+		}
+	}
+
+	refreshUsbBtn := widget.NewButtonWithIcon("Aggiorna USB", theme.ViewRefreshIcon(), refreshDrives)
+	refreshDrives()
+
+	// Hot-Plug Watcher: controlla automaticamente ogni 2.5 secondi se viene inserita una chiavetta USB
+	go func() {
+		ticker := time.NewTicker(2500 * time.Millisecond)
+		defer ticker.Stop()
+		var lastCount int
+		for {
+			select {
+			case <-stopWatcher:
+				return
+			case <-ticker.C:
+				drives := usb.DetectUSBDrives()
+				if len(drives) != lastCount {
+					lastCount = len(drives)
+					refreshDrives()
+				}
+			}
+		}
+	}()
+
+	browseBtn := widget.NewButtonWithIcon("Sfoglia Cartella", theme.FolderOpenIcon(), func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err == nil && uri != nil {
 				usbPathEntry.SetText(uri.Path())
@@ -52,13 +127,37 @@ func showUnlockScreen(w fyne.Window) {
 	})
 
 	passEntry := widget.NewPasswordEntry()
-	passEntry.SetPlaceHolder("Password crittografica (Argon2id)")
+	passEntry.SetPlaceHolder("Password Master Crittografica (Argon2id + XChaCha20-Poly1305)")
 
-	openBtn := widget.NewButtonWithIcon("Sblocca ed Esplora", theme.LoginIcon(), func() {
+	entropyBar := widget.NewProgressBar()
+	entropyBar.Min = 0
+	entropyBar.Max = 128
+	entropyLabel := widget.NewLabel("Sicurezza Password: in attesa di inserimento...")
+
+	passEntry.OnChanged = func(pw string) {
+		bits := estimatePasswordEntropyBits(pw)
+		if bits > 128 {
+			entropyBar.SetValue(128)
+		} else {
+			entropyBar.SetValue(bits)
+		}
+		switch {
+		case bits == 0:
+			entropyLabel.SetText("Sicurezza Password: in attesa di inserimento...")
+		case bits < 45:
+			entropyLabel.SetText(fmt.Sprintf("⚠️ Sicurezza Password: Debole (%.0f bit di entropia)", bits))
+		case bits < 75:
+			entropyLabel.SetText(fmt.Sprintf("🛡️ Sicurezza Password: Buona (%.0f bit di entropia)", bits))
+		default:
+			entropyLabel.SetText(fmt.Sprintf("🔥 Sicurezza Password: Eccellente / Militare (%.0f bit di entropia)", bits))
+		}
+	}
+
+	openBtn := widget.NewButtonWithIcon("🔓 Sblocca Vault Esistente", theme.LoginIcon(), func() {
 		path := strings.TrimSpace(usbPathEntry.Text)
 		pass := passEntry.Text
 		if path == "" || pass == "" {
-			dialog.ShowError(errors.New("inserire sia il percorso della USB che la password"), w)
+			dialog.ShowError(errors.New("seleziona la chiavetta USB e inserisci la password"), w)
 			return
 		}
 		v, err := vault.InitOrOpenVault(path, pass, false)
@@ -66,19 +165,20 @@ func showUnlockScreen(w fyne.Window) {
 			dialog.ShowError(err, w)
 			return
 		}
+		stopHotplug()
 		showExplorerScreen(w, v)
 	})
 	openBtn.Importance = widget.HighImportance
 
-	initBtn := widget.NewButtonWithIcon("Inizializza Nuovo Vault (SVAULT03)", theme.ContentAddIcon(), func() {
+	initBtn := widget.NewButtonWithIcon("✨ Inizializza Nuovo Vault (SVAULT03)", theme.ContentAddIcon(), func() {
 		path := strings.TrimSpace(usbPathEntry.Text)
 		pass := passEntry.Text
 		if path == "" || len(pass) < 6 {
 			dialog.ShowError(errors.New("seleziona il percorso USB e usa una password di almeno 6 caratteri"), w)
 			return
 		}
-		dialog.ShowConfirm("Conferma Inizializzazione",
-			"Questo creerà un nuovo Vault SVAULT03 sulla chiavetta. Procedere?",
+		dialog.ShowConfirm("Conferma Inizializzazione SVAULT03",
+			"Questo creerà un nuovo Vault SVAULT03 (con Key Wrapping e Zstd 4MB) sulla chiavetta selezionata. Procedere?",
 			func(ok bool) {
 				if !ok {
 					return
@@ -88,12 +188,13 @@ func showUnlockScreen(w fyne.Window) {
 					dialog.ShowError(err, w)
 					return
 				}
+				stopHotplug()
 				showExplorerScreen(w, v)
 			}, w)
 	})
 
 	devEntry := widget.NewEntry()
-	devEntry.SetPlaceHolder("Dispositivo grezzo (es. E: su Windows, /dev/sdb1 su Linux, /dev/disk2 su Mac)")
+	devEntry.SetPlaceHolder("Dispositivo grezzo da formattare (es. E: su Windows, /dev/sdb1 su Linux, /dev/disk2 su Mac)")
 	formatBtn := widget.NewButtonWithIcon("Formatta Hardware USB in exFAT", theme.StorageIcon(), func() {
 		dev := strings.TrimSpace(devEntry.Text)
 		if dev == "" {
@@ -109,24 +210,39 @@ func showUnlockScreen(w fyne.Window) {
 				if err := usb.FormatPhysicalUSB(dev, "SECURE_USB"); err != nil {
 					dialog.ShowError(err, w)
 				} else {
+					refreshDrives()
 					dialog.ShowInformation("Formattazione Completata",
-						"Chiavetta formattata in exFAT! Ora seleziona la cartella montata e clicca 'Inizializza Nuovo Vault'.", w)
+						"Chiavetta formattata in exFAT! Ora selezionala dal menu a tendina e clicca 'Inizializza Nuovo Vault'.", w)
 				}
 			}, w)
 	})
 
-	card := container.NewVBox(
-		widget.NewLabelWithStyle("Sblocco e Gestione Chiavetta Cifrata (Supporto Drag & Drop Attivo)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewBorder(nil, nil, nil, browseBtn, usbPathEntry),
-		passEntry,
-		container.NewGridWithColumns(2, openBtn, initBtn),
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Utilità Formattazione Fisica (exFAT Cross-Platform)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		devEntry,
-		formatBtn,
+	vaultCard := widget.NewCard(
+		"🔐 Accesso Rapido al Vault Cifrato (SVAULT03)",
+		"Rilevamento automatico USB Hot-Plug • Argon2id (64 MB) • XChaCha20-Poly1305 • Zstd 4MB",
+		container.NewVBox(
+			usbStatusBadge,
+			container.NewBorder(nil, nil, nil, refreshUsbBtn, usbSelect),
+			container.NewBorder(nil, nil, nil, browseBtn, usbPathEntry),
+			widget.NewSeparator(),
+			passEntry,
+			container.NewGridWithColumns(2, entropyLabel, entropyBar),
+			widget.NewSeparator(),
+			container.NewGridWithColumns(2, openBtn, initBtn),
+		),
 	)
 
-	w.SetContent(container.NewPadded(card))
+	formatCard := widget.NewCard(
+		"🛠️ Preparazione Fisica Chiavetta (exFAT Cross-Platform)",
+		"Formatta il supporto fisico per renderlo compatibile nativamente con Windows, Linux e macOS senza limiti di 4 GB",
+		container.NewVBox(
+			devEntry,
+			formatBtn,
+		),
+	)
+
+	content := container.NewVBox(vaultCard, formatCard)
+	w.SetContent(container.NewPadded(container.NewVScroll(content)))
 }
 
 func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
@@ -135,35 +251,99 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	var selectedEntry *vault.FileEntry
 	var unmountFuse func()
 
-	pathLabel := widget.NewLabelWithStyle("Percorso: / (Trascina qui file o cartelle dal PC per importarli)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	infoLabel := widget.NewLabel("Seleziona un file o trascina file/cartelle nella finestra.")
+	stopWatchdog := make(chan struct{})
+	watchdogStopped := false
+	stopUnplugWatchdog := func() {
+		if !watchdogStopped {
+			watchdogStopped = true
+			close(stopWatchdog)
+		}
+	}
+
+	breadcrumbBox := container.NewHBox()
+	searchEntry := widget.NewEntry()
+	searchEntry.SetPlaceHolder("🔍 Cerca istantaneamente file o cartelle in RAM...")
+
+	telemetryLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	savingsBar := widget.NewProgressBar()
+	savingsBar.Min = 0
+	savingsBar.Max = 100
+
+	infoLabel := widget.NewLabel("Seleziona un elemento o rilascia file/cartelle con Drag & Drop.")
 
 	editor := widget.NewMultiLineEntry()
-	editor.SetPlaceHolder("Editor integrato per file di testo (fino a 16 MB). Trascina file o cartelle in qualsiasi punto della finestra per cifrarli in SVAULT03.")
+	editor.SetPlaceHolder("Editor di testo integrato in RAM. Seleziona un'immagine (PNG/JPG/GIF) o un PDF per l'anteprima immediata Zero-Temp.")
 	editor.Disable()
 
 	previewHolder := container.NewMax(editor)
-
 	var listWidget *widget.List
+	var refreshList func()
 
-	searchEntry := widget.NewEntry()
-	searchEntry.SetPlaceHolder("🔍 Cerca istantaneamente in tutto il Vault (in RAM)...")
+	rebuildBreadcrumbs := func() {
+		breadcrumbBox.Objects = nil
+		rootBtn := widget.NewButtonWithIcon("/ Root", theme.HomeIcon(), func() {
+			searchEntry.SetText("")
+			currentDir = "/"
+			refreshList()
+		})
+		if currentDir == "/" {
+			rootBtn.Importance = widget.HighImportance
+		}
+		breadcrumbBox.Add(rootBtn)
 
-	refreshList := func() {
+		if currentDir != "/" {
+			parts := strings.Split(strings.Trim(currentDir, "/"), "/")
+			accum := ""
+			for i, part := range parts {
+				accum += "/" + part
+				targetPath := accum
+				breadcrumbBox.Add(widget.NewLabel("❯"))
+				btn := widget.NewButton(part, func() {
+					searchEntry.SetText("")
+					currentDir = targetPath
+					refreshList()
+				})
+				if i == len(parts)-1 {
+					btn.Importance = widget.HighImportance
+				}
+				breadcrumbBox.Add(btn)
+			}
+		}
+		breadcrumbBox.Refresh()
+	}
+
+	updateTelemetry := func() {
+		st := v.Stats()
+		savedBytes := st.OriginalSize - st.DiskSize
+		ratioPct := 0.0
+		if st.OriginalSize > 0 && savedBytes > 0 {
+			ratioPct = (float64(savedBytes) / float64(st.OriginalSize)) * 100
+		}
+		savingsBar.SetValue(ratioPct)
+		telemetryLabel.SetText(fmt.Sprintf(
+			"📊 Vault: %d File, %d Cartelle (%d Chunk 4MB)  |  Reale: %s  ➔  Su USB (Zstd+AEAD): %s  |  Risparmio Compressione: %.1f%%",
+			st.TotalFiles, st.TotalFolders, st.TotalChunks,
+			formatBytes(st.OriginalSize), formatBytes(st.DiskSize), ratioPct,
+		))
+	}
+
+	refreshList = func() {
+		rebuildBreadcrumbs()
+		updateTelemetry()
+
 		q := strings.TrimSpace(searchEntry.Text)
-		if q == "" {
-			entries = v.ListDir(currentDir)
-			pathLabel.SetText("Percorso: " + currentDir + "  —  [Drag & Drop attivo]")
-		} else {
+		if q != "" {
 			entries = v.Search(q)
-			pathLabel.SetText(fmt.Sprintf("Risultati ricerca in RAM per %q (%d trovati)", q, len(entries)))
+			infoLabel.SetText(fmt.Sprintf("🔍 Ricerca RAM per %q: %d risultati trovati", q, len(entries)))
+		} else {
+			entries = v.ListDir(currentDir)
+			infoLabel.SetText(fmt.Sprintf("📂 %d elementi in %s  —  [Drag & Drop attivo]", len(entries), currentDir))
 		}
 		selectedEntry = nil
 		editor.SetText("")
 		editor.Disable()
 		previewHolder.Objects = []fyne.CanvasObject{editor}
 		previewHolder.Refresh()
-		infoLabel.SetText(fmt.Sprintf("%d elementi visualizzati", len(entries)))
 		if listWidget != nil {
 			listWidget.UnselectAll()
 			listWidget.Refresh()
@@ -174,7 +354,31 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		refreshList()
 	}
 
-	// Gestione nativa Drag & Drop di file e cartelle dal sistema operativo dentro la finestra Fyne
+	// Watchdog Rimozione Fisica USB: se la chiavetta viene staccata, azzera la DEK in RAM e blocca subito la GUI
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWatchdog:
+				return
+			case <-ticker.C:
+				if !v.IsMountAlive() {
+					stopUnplugWatchdog()
+					if unmountFuse != nil {
+						unmountFuse()
+						unmountFuse = nil
+					}
+					v.Close()
+					showUnlockScreen(w)
+					dialog.ShowInformation("🔒 Blocco di Emergenza Attivato",
+						"La chiavetta USB è stata rimossa: la chiave crittografica in RAM è stata azzerata automaticamente.", w)
+					return
+				}
+			}
+		}
+	}()
+
 	w.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
 		if len(uris) == 0 {
 			return
@@ -236,7 +440,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 				dialog.ShowError(lastErr, w)
 			} else {
 				dialog.ShowInformation("Drag & Drop Completato",
-					fmt.Sprintf("Importati e cifrati %d file in '%s' (file temporanei esclusi automaticamente).", totalImported, currentDir), w)
+					fmt.Sprintf("Importati e cifrati %d file in '%s'!", totalImported, currentDir), w)
 			}
 		}()
 	})
@@ -245,7 +449,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		func() int { return len(entries) },
 		func() fyne.CanvasObject {
 			icon := widget.NewIcon(theme.FileIcon())
-			name := widget.NewLabel("Nome File")
+			name := widget.NewLabelWithStyle("Nome File", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 			meta := widget.NewLabel("Dimensioni")
 			return container.NewBorder(nil, nil, icon, meta, name)
 		},
@@ -259,23 +463,29 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			meta := box.Objects[2].(*widget.Label)
 			name := box.Objects[0].(*widget.Label)
 
-			baseName := filepath.Base(e.VirtualPath)
+			displayName := filepath.Base(e.VirtualPath)
+			if strings.TrimSpace(searchEntry.Text) != "" {
+				displayName = e.VirtualPath
+			}
+
 			if e.IsDir {
 				icon.SetResource(theme.FolderIcon())
-				name.SetText(baseName + "/")
-				meta.SetText("Cartella")
+				name.SetText(displayName + "/")
+				meta.SetText("📁 Cartella")
 			} else {
-				if isImageExt(baseName) {
+				if isImageExt(displayName) {
 					icon.SetResource(theme.MediaPhotoIcon())
+				} else if isPDFExt(displayName) {
+					icon.SetResource(theme.FileTextIcon())
 				} else {
 					icon.SetResource(theme.DocumentIcon())
 				}
-				name.SetText(baseName)
+				name.SetText(displayName)
 				ratio := 100.0
 				if e.OriginalSize > 0 {
 					ratio = (float64(e.DiskSize) / float64(e.OriginalSize)) * 100
 				}
-				meta.SetText(fmt.Sprintf("%s (%d chunk | %.0f%%)", formatBytes(e.OriginalSize), len(e.ChunkSizes), ratio))
+				meta.SetText(fmt.Sprintf("%s ➔ %s (%.0f%%)", formatBytes(e.OriginalSize), formatBytes(e.DiskSize), ratio))
 			}
 		},
 	)
@@ -288,13 +498,14 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		selectedEntry = &e
 
 		if e.IsDir {
+			searchEntry.SetText("")
 			currentDir = e.VirtualPath
 			refreshList()
 			return
 		}
 
-		infoLabel.SetText(fmt.Sprintf("File: %s | Reale: %s | Su disco: %s | Chunk da 4MB: %d",
-			filepath.Base(e.VirtualPath), formatBytes(e.OriginalSize), formatBytes(e.DiskSize), len(e.ChunkSizes)))
+		infoLabel.SetText(fmt.Sprintf("📄 %s  |  Reale: %s  |  Su USB: %s  |  Chunk 4MB: %d",
+			e.VirtualPath, formatBytes(e.OriginalSize), formatBytes(e.DiskSize), len(e.ChunkSizes)))
 
 		if isImageExt(e.VirtualPath) {
 			if imgView, err := buildImagePreview(v, e.VirtualPath); err == nil {
@@ -319,7 +530,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 
 		if e.OriginalSize > vault.MaxTextPreviewSize {
 			editor.Disable()
-			editor.SetText(fmt.Sprintf("[File di grandi dimensioni (%s in %d chunk da 4 MB).\n• Clicca 'Stream Video al Volo' per riprodurlo subito con Random-Access O(1).\n• Oppure monta il Vault come disco FUSE/WinFsp.]",
+			editor.SetText(fmt.Sprintf("[File Multimediale / Grande (%s in %d chunk da 4 MB).\n• Clicca 'Stream Video' per riprodurlo subito in O(1) senza file temporanei.\n• Oppure clicca 'Monta FUSE' per accedervi come disco nativo.]",
 				formatBytes(e.OriginalSize), len(e.ChunkSizes)))
 			return
 		}
@@ -335,7 +546,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			editor.SetText(string(data))
 		} else {
 			editor.Disable()
-			editor.SetText("[File binario — Usa 'Stream Video al Volo', 'Monta Disco FUSE' o 'App Esterna']")
+			editor.SetText("[File binario — Usa 'Stream Video', 'Monta FUSE' o 'App Esterna']")
 		}
 	}
 
@@ -368,7 +579,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 
 	newFileBtn := widget.NewButtonWithIcon("+Testo", theme.DocumentCreateIcon(), func() {
 		nameEntry := widget.NewEntry()
-		nameEntry.SetPlaceHolder("note.txt")
+		nameEntry.SetPlaceHolder("appunti.txt")
 		dialog.ShowForm("Nuovo File", "Crea", "Annulla", []*widget.FormItem{
 			widget.NewFormItem("Nome file", nameEntry),
 		}, func(ok bool) {
@@ -453,7 +664,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 					return
 				}
 				dialog.ShowInformation("Cartella Importata",
-					fmt.Sprintf("Importati e cifrati %d file (file temporanei esclusi)!", count), w)
+					fmt.Sprintf("Importati e cifrati %d file!", count), w)
 				refreshList()
 			}()
 		}, w)
@@ -603,6 +814,48 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		}, w)
 	})
 
+	changePassBtn := widget.NewButtonWithIcon("Password", theme.AccountIcon(), func() {
+		oldPass := widget.NewPasswordEntry()
+		newPass := widget.NewPasswordEntry()
+		dialog.ShowForm("Cambio Password Istantaneo (Key Wrapping)", "Aggiorna", "Annulla", []*widget.FormItem{
+			widget.NewFormItem("Password Attuale", oldPass),
+			widget.NewFormItem("Nuova Password", newPass),
+		}, func(ok bool) {
+			if !ok {
+				return
+			}
+			if err := v.ChangePassword(oldPass.Text, newPass.Text); err != nil {
+				dialog.ShowError(err, w)
+			} else {
+				dialog.ShowInformation("Password Aggiornata",
+					"La Data Encryption Key (DEK) è stata ri-avvolta con successo in pochi millisecondi!", w)
+			}
+		}, w)
+	})
+
+	scrubBtn := widget.NewButtonWithIcon("Scrub Poly1305", theme.ConfirmIcon(), func() {
+		prog := dialog.NewProgress("Verifica Integrità Globale (Poly1305 + Zstd)",
+			"Controllo multi-core di tutti i blocchi sulla chiavetta...", w)
+		prog.Show()
+
+		go func() {
+			rep, _ := v.ScrubIntegrity(func(done, total int64) {
+				if total > 0 {
+					prog.SetValue(float64(done) / float64(total))
+				}
+			})
+			prog.Hide()
+			if len(rep.CorruptedFiles) == 0 {
+				dialog.ShowInformation("Integrità Certificata (100%)",
+					fmt.Sprintf("File verificati: %d\nChunk da 4MB autenticati: %d\nDati controllati: %s\nNessun bit-rot o manomissione rilevata!",
+						rep.TotalFiles, rep.VerifiedChunks, formatBytes(rep.VerifiedBytes)), w)
+			} else {
+				dialog.ShowError(fmt.Errorf("rilevati %d file corrotti: %v",
+					len(rep.CorruptedFiles), strings.Join(rep.CorruptedFiles, ", ")), w)
+			}
+		}()
+	})
+
 	saveBtn := widget.NewButtonWithIcon("Salva Testo", theme.DocumentSaveIcon(), func() {
 		if selectedEntry == nil || selectedEntry.IsDir || editor.Disabled() {
 			return
@@ -633,6 +886,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	deleteBtn.Importance = widget.DangerImportance
 
 	lockBtn := widget.NewButtonWithIcon("Blocca", theme.LogoutIcon(), func() {
+		stopUnplugWatchdog()
 		if unmountFuse != nil {
 			unmountFuse()
 			unmountFuse = nil
@@ -641,57 +895,21 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		showUnlockScreen(w)
 	})
 
-	changePwdBtn := widget.NewButtonWithIcon("Password", theme.AccountIcon(), func() {
-		oldPass := widget.NewPasswordEntry()
-		newPass := widget.NewPasswordEntry()
-		dialog.ShowForm("Cambio Password Istantaneo (Key Wrapping)", "Aggiorna KEK", "Annulla", []*widget.FormItem{
-			widget.NewFormItem("Password Attuale", oldPass),
-			widget.NewFormItem("Nuova Password", newPass),
-		}, func(ok bool) {
-			if !ok {
-				return
-			}
-			if err := v.ChangePassword(oldPass.Text, newPass.Text); err != nil {
-				dialog.ShowError(err, w)
-				return
-			}
-			dialog.ShowInformation("Password Aggiornata",
-				"La Master Key (DEK) è stata ricifrata istantaneamente con la nuova password senza riscrivere i blocchi dati!", w)
-		}, w)
-	})
-
-	scrubBtn := widget.NewButtonWithIcon("Verifica Integrità", theme.ConfirmIcon(), func() {
-		prog := dialog.NewProgress("Scrubbing Crittografico Poly1305 Multi-Core",
-			"Verifica dei tag AEAD su tutti i blocchi della chiavetta...", w)
-		prog.Show()
-		go func() {
-			rep, _ := v.VerifyIntegrity(func(done, total int64) {
-				if total > 0 {
-					prog.SetValue(float64(done) / float64(total))
-				}
-			})
-			prog.Hide()
-			if len(rep.CorruptedFiles) == 0 {
-				dialog.ShowInformation("Integrità Certificata (100%)",
-					fmt.Sprintf("Verificati %d file (%d chunk da 4 MB, %s).\nNessun bit-rot o manomissione rilevata!",
-						rep.FilesChecked, rep.ChunksVerified, formatBytes(rep.BytesVerified)), w)
-			} else {
-				dialog.ShowError(fmt.Errorf("rilevati %d file corrotti:\n%s",
-					len(rep.CorruptedFiles), strings.Join(rep.CorruptedFiles, "\n")), w)
-			}
-		}()
-	})
-
 	topBar := container.NewVBox(
-		container.NewHBox(
+		container.NewHScroll(container.NewHBox(
 			upBtn, newFolderBtn, newFileBtn,
 			importBtn, importDirBtn,
 			streamPlayBtn, fuseBtn, openExtBtn,
 			exportBtn, exportDirBtn,
-			scrubBtn, changePwdBtn, deleteBtn, lockBtn,
-		),
-		container.NewBorder(nil, nil, pathLabel, nil, searchEntry),
+			scrubBtn, changePassBtn, deleteBtn, lockBtn,
+		)),
+		container.NewGridWithColumns(2, container.NewHScroll(breadcrumbBox), searchEntry),
 		widget.NewSeparator(),
+	)
+
+	bottomStatusBar := container.NewVBox(
+		widget.NewSeparator(),
+		container.NewBorder(nil, nil, telemetryLabel, nil, savingsBar),
 	)
 
 	rightPane := container.NewBorder(
@@ -704,7 +922,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	split.Offset = 0.38
 
 	refreshList()
-	w.SetContent(container.NewBorder(topBar, nil, nil, nil, split))
+	w.SetContent(container.NewBorder(topBar, bottomStatusBar, nil, nil, split))
 }
 
 func openURLOrFileInOS(target string) {

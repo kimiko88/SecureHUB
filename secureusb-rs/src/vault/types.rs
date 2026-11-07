@@ -16,16 +16,8 @@ pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB
 pub const MAX_COMPRESSED_CHUNK: usize = CHUNK_SIZE + (CHUNK_SIZE / 8) + 65536;
 pub const MAX_TEXT_PREVIEW_SIZE: u64 = 16 * 1024 * 1024;
 pub const VAULT_STREAM_MAGIC: &[u8; 8] = b"SVAULT03";
-pub const KEY_WRAP_AAD: &[u8] = b"SVAULT03-KEYWRAP";
+pub const VAULT_KEY_MAGIC: &[u8; 7] = b"SVKEY03";
 
-#[derive(Debug, Clone, Default)]
-pub struct IntegrityReport {
-    pub files_checked: usize,
-    pub chunks_verified: usize,
-    pub bytes_verified: u64,
-    pub corrupted_files: Vec<String>,
-}
-/// Restituisce true se il nome o percorso corrisponde a un file temporaneo o di sistema da escludere.
 pub fn should_ignore_entry(name_or_path: impl AsRef<Path>) -> bool {
     let Some(os_name) = name_or_path.as_ref().file_name() else {
         return false;
@@ -61,27 +53,12 @@ pub fn should_ignore_entry(name_or_path: impl AsRef<Path>) -> bool {
         || lower.ends_with('~')
 }
 
-/// MasterKey a 256-bit protetta da ZeroizeOnDrop e ancorata nella RAM fisica con mlock.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct MasterKey {
     bytes: [u8; KEY_SIZE],
 }
 
 impl MasterKey {
-    pub fn generate_random() -> Self {
-        let mut key = MasterKey {
-            bytes: [0u8; KEY_SIZE],
-        };
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key.bytes);
-        key.lock_memory();
-        key
-    }
-
-    pub fn from_raw(raw: [u8; KEY_SIZE]) -> Self {
-        let key = MasterKey { bytes: raw };
-        key.lock_memory();
-        key
-    }
     pub fn derive_from_password(password: &str, salt: &[u8]) -> io::Result<Self> {
         let params = Params::new(64 * 1024, 3, 4, Some(KEY_SIZE))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
@@ -96,6 +73,21 @@ impl MasterKey {
 
         key.lock_memory();
         Ok(key)
+    }
+
+    pub fn generate_random() -> Self {
+        let mut key = MasterKey {
+            bytes: [0u8; KEY_SIZE],
+        };
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key.bytes);
+        key.lock_memory();
+        key
+    }
+
+    pub fn from_raw_bytes(raw: [u8; KEY_SIZE]) -> Self {
+        let key = MasterKey { bytes: raw };
+        key.lock_memory();
+        key
     }
 
     #[inline]
@@ -129,6 +121,23 @@ pub struct FileEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VaultIndex {
     pub entries: HashMap<String, FileEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScrubReport {
+    pub total_files: usize,
+    pub verified_chunks: usize,
+    pub verified_bytes: u64,
+    pub corrupted_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VaultStats {
+    pub total_files: usize,
+    pub total_folders: usize,
+    pub total_chunks: usize,
+    pub original_size: u64,
+    pub disk_size: u64,
 }
 
 #[inline]

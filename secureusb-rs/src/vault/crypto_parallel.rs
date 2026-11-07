@@ -17,7 +17,34 @@ struct EncryptedChunkOut {
     cipher_only_len: u32,
 }
 
-/// Comprime con Zstd e cifra IN-PLACE con XChaCha20-Poly1305 usando il work-stealing pool di Rayon.
+/// Seleziona dinamicamente il livello di compressione Zstd campionando l'entropia sui primi 16 KB:
+/// - Dati ad alta entropia (> 7.85 bit/byte, es. video MP4/MKV o archivi): livello 1 (massima velocità)
+/// - Dati comprimibili (testo, PDF, DB, binari, immagini raw): livello 6 (massima compressione senza perdere velocità in lettura)
+#[inline]
+fn adaptive_zstd_level(data: &[u8], default_level: i32) -> i32 {
+    let sample = &data[..data.len().min(16 * 1024)];
+    if sample.len() < 512 {
+        return default_level;
+    }
+    let mut counts = [0u32; 256];
+    for &b in sample {
+        counts[b as usize] += 1;
+    }
+    let inv_len = 1.0f32 / (sample.len() as f32);
+    let mut entropy = 0.0f32;
+    for &c in &counts {
+        if c > 0 {
+            let p = (c as f32) * inv_len;
+            entropy -= p * p.log2();
+        }
+    }
+    if entropy > 7.85 {
+        1
+    } else {
+        6
+    }
+}
+
 pub fn encrypt_stream_parallel<R: Read, W: Write>(
     cipher: &XChaCha20Poly1305,
     src: R,
@@ -70,29 +97,26 @@ pub fn encrypt_stream_parallel<R: Read, W: Write>(
             }
         }
 
-        // Esecuzione parallela su tutti i core CPU con cifratura IN-PLACE (zero copie intermedie)
         let encrypted_batch: io::Result<Vec<EncryptedChunkOut>> = batch
             .into_par_iter()
             .map(|job| {
                 let plain_len = job.plain_data.len() as u64;
                 let max_comp = zstd::zstd_safe::compress_bound(job.plain_data.len());
+                let level = adaptive_zstd_level(&job.plain_data, zstd_level);
 
-                // Alloca un unico buffer contiguo: [len: 4B] + [payload compresso/cifrato] + [tag: 16B]
                 let mut packet = vec![0u8; 4 + max_comp];
-                let mut compressor = zstd::bulk::Compressor::new(zstd_level)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                let _ = compressor.window_log(22); // 2^22 = 4 MB esatti per singolo chunk
-                let _ = compressor.long_distance_matching(true);
+                let comp_size = zstd::bulk::compress_to_buffer(
+                    &job.plain_data,
+                    &mut packet[4..],
+                    level,
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-                let comp_size = compressor
-                    .compress_to_buffer(&job.plain_data, &mut packet[4..])
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                 packet.truncate(4 + comp_size);
 
                 let (nonce, aad) =
                     build_chunk_nonce_and_aad(&stream_id, job.chunk_index, job.is_final);
 
-                // Cifra direttamente sul posto dentro packet[4..] senza allocare un secondo Vec
                 let tag = cipher
                     .encrypt_in_place_detached(
                         XNonce::from_slice(&nonce),
@@ -137,7 +161,6 @@ struct DecryptedChunkOut {
     is_final: bool,
 }
 
-/// Autentica (Poly1305) IN-PLACE e decomprime (Zstd) i chunk da 4 MB in parallelo su tutti i core CPU.
 pub fn decrypt_stream_parallel<R: Read, W: Write>(
     cipher: &XChaCha20Poly1305,
     mut src: R,
@@ -205,7 +228,6 @@ pub fn decrypt_stream_parallel<R: Read, W: Write>(
                 let (nonce_mid, aad_mid) =
                     build_chunk_nonce_and_aad(&stream_id, job.chunk_index, false);
 
-                // Copia di backup solo se dobbiamo ritentare come chunk finale (accade 1 sola volta a fine file)
                 let backup_for_final = job.cipher_buf.clone();
                 let (ct_slice, tag_slice) = job.cipher_buf.split_at_mut(tag_pos);
                 let tag = Tag::from_slice(tag_slice);
@@ -245,7 +267,6 @@ pub fn decrypt_stream_parallel<R: Read, W: Write>(
                     true
                 };
 
-                // Decomprime con Zstd solo DOPO che Poly1305 ha autenticato il blocco in-place
                 let plain_data =
                     zstd::bulk::decompress(&job.cipher_buf[..tag_pos], CHUNK_SIZE)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

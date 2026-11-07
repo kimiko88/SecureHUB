@@ -14,7 +14,7 @@ import (
 
 const (
 	SaltSize           = 16
-	KeySize            = chacha20poly1305.KeySize    // 32 byte (256-bit)
+	KeySize            = chacha20poly1305.KeySize   // 32 byte (256-bit)
 	NonceSize          = chacha20poly1305.NonceSizeX // 24 byte (192-bit)
 	StreamIDSize       = 15                          // 15B StreamID + 8B ChunkCounter + 1B FinalFlag = 24B Nonce
 	HeaderSize         = 8 + StreamIDSize            // 8B Magic + 15B StreamID = 23 byte
@@ -25,6 +25,7 @@ const (
 	ArgonMemory        = 64 * 1024 // 64 MB
 	ArgonThreads       = 4
 	VaultStreamMagic   = "SVAULT03"
+	VaultKeyMagic      = "SVKEY03"
 )
 
 type ProgressFunc func(processedBytes, totalBytes int64)
@@ -43,13 +44,28 @@ type VaultIndex struct {
 	Entries map[string]FileEntry `json:"entries"`
 }
 
-const KeyWrapAAD = "SVAULT03-KEYWRAP"
+// ScrubReport contiene l'esito della verifica di integrità globale Poly1305
+type ScrubReport struct {
+	TotalFiles     int
+	VerifiedChunks int
+	VerifiedBytes  int64
+	CorruptedFiles []string
+}
+
+// VaultStats fornisce le metriche di compressione e utilizzo per la dashboard GUI
+type VaultStats struct {
+	TotalFiles   int
+	TotalFolders int
+	TotalChunks  int
+	OriginalSize int64
+	DiskSize     int64
+}
 
 type SecureVault struct {
 	mu             sync.RWMutex
 	rootPath       string
 	salt           []byte
-	dek            []byte // Master Data Encryption Key (32B) protetta da Key Wrapping
+	dek            []byte
 	aead           cipher.AEAD
 	encoder        *zstd.Encoder
 	decoder        *zstd.Decoder
@@ -57,14 +73,6 @@ type SecureVault struct {
 	index          VaultIndex
 	streamListener net.Listener
 	streamToken    string
-}
-
-// IntegrityReport riassume l'esito dello scrubbing Poly1305 globale
-type IntegrityReport struct {
-	FilesChecked   int
-	ChunksVerified int
-	BytesVerified  int64
-	CorruptedFiles []string
 }
 
 func deriveKey(password string, salt []byte) []byte {

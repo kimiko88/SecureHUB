@@ -837,3 +837,33 @@ func SecureEraseFile(path string) {
 	}
 	_ = os.Remove(path)
 }
+
+// AllFiles restituisce tutti i file (non cartelle) presenti sotto dirPrefix ordinati per dimensione decrescente.
+func (v *SecureVault) AllFiles(dirPrefix string) []FileEntry {
+	dirPrefix = normalizePath(dirPrefix)
+	prefix := dirPrefix + "/"
+	if dirPrefix == "/" {
+		prefix = "/"
+	}
+
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	var files []FileEntry
+	for _, entry := range v.index.Entries {
+		if entry.IsDir || entry.VirtualPath == "/" {
+			continue
+		}
+		if dirPrefix == "/" || strings.HasPrefix(entry.VirtualPath, prefix) {
+			files = append(files, entry)
+		}
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].OriginalSize != files[j].OriginalSize {
+			return files[i].OriginalSize > files[j].OriginalSize
+		}
+		return files[i].VirtualPath < files[j].VirtualPath
+	})
+	return files
+}

@@ -608,6 +608,34 @@ impl SecureVault {
         self.save_index()
     }
 
+    /// Restituisce tutti i file contenuti nel sotto-albero `dir_prefix` ordinati per dimensione decrescente.
+    pub fn all_files(&self, dir_prefix: &str) -> Vec<FileEntry> {
+        let dpath = normalize_path(dir_prefix);
+        let prefix = if dpath == "/" {
+            "/".to_string()
+        } else {
+            format!("{dpath}/")
+        };
+        let idx = self.index.read().unwrap();
+        let mut files: Vec<FileEntry> = idx
+            .entries
+            .values()
+            .filter(|e| {
+                !e.is_dir
+                    && e.virtual_path != "/"
+                    && (dpath == "/" || e.virtual_path.starts_with(&prefix))
+            })
+            .cloned()
+            .collect();
+
+        files.sort_by(|a, b| {
+            b.original_size
+                .cmp(&a.original_size)
+                .then_with(|| a.virtual_path.cmp(&b.virtual_path))
+        });
+        files
+    }
+
     pub fn list_dir(&self, dir_path: &str) -> Vec<FileEntry> {
         let dpath = normalize_path(dir_path);
         let idx = self.index.read().unwrap();

@@ -1,9 +1,8 @@
-name: SecureUSB CI/CD — Build & Test (Go + Rust)
+name: SecureUSB CI/CD — Auto-Version, Build & Release (Go + Rust)
 
 on:
   push:
     branches: ["main", "master"]
-    tags: ["v*"]
   pull_request:
     branches: ["main", "master"]
 
@@ -11,6 +10,9 @@ permissions:
   contents: write
 
 jobs:
+  # ==========================================================================
+  # 1. SUITE DI TEST, RACE DETECTOR, FUZZING BREVE E BENCHMARK (GO + RUST)
+  # ==========================================================================
   verify-and-test:
     name: Test, Fuzz & Bench (Ubuntu)
     runs-on: ubuntu-latest
@@ -31,7 +33,7 @@ jobs:
       - name: Setup Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run Go Unit, Integration & E2E Tests (with Race Detector)
+      - name: Run Go Unit, Integration, E2E & v0.5 Tests (with Race Detector)
         run: |
           go mod tidy
           go test -v -race ./internal/vault/...
@@ -44,7 +46,7 @@ jobs:
         run: |
           go test -bench=. -benchmem -run=^$ ./internal/vault
 
-      - name: Run Rust Unit, Integration, E2E & Proptest Fuzz Suite
+      - name: Run Rust Unit, Integration, E2E, Proptest & v0.5 Suite
         working-directory: secureusb-rs
         run: |
           cargo test --release -- --nocapture
@@ -54,6 +56,9 @@ jobs:
         run: |
           cargo bench --bench vault_bench -- --quick
 
+  # ==========================================================================
+  # 2. MATRICE DI COMPILAZIONE CROSS-PLATFORM (LINUX, WINDOWS, MACOS) — GO & RUST
+  # ==========================================================================
   build-matrix:
     name: Build (${{ matrix.os_name }} — Go & Rust)
     needs: verify-and-test
@@ -167,13 +172,57 @@ jobs:
           name: binaries-${{ matrix.os_name }}
           path: dist/*
 
+  # ==========================================================================
+  # 3. VERSIONAMENTO SEMANTICO AUTOMATICO & RELEASE AD OGNI COMMIT SU MAIN/MASTER
+  # ==========================================================================
   publish-release:
     name: Publish GitHub Release (6 Executables)
     needs: build-matrix
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
     steps:
-      - name: Download All Built Artifacts
+      - name: Checkout Repository with Full Tag History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate Next Semantic Version Tag Automatically
+        id: semver
+        shell: bash
+        run: |
+          git fetch --tags --force
+          LATEST_TAG=$(git tag -l "v*.*.*" --sort=-v:refname | head -n 1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v0.5.0"
+          fi
+          echo "Ultimo tag rilevato: $LATEST_TAG"
+
+          VERSION=${LATEST_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+
+          if [[ "$COMMIT_MSG" == *"[major]"* ]]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif [[ "$COMMIT_MSG" == *"[minor]"* ]]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          # Evita collisioni se il tag esiste già
+          while git rev-parse "$NEW_TAG" >/dev/null 2>&1; do
+            PATCH=$((PATCH + 1))
+            NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          done
+
+          echo "Nuova versione generata per questo commit: $NEW_TAG"
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+
+      - name: Download All 6 Built Executables
         uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -185,8 +234,11 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Create GitHub Release
+      - name: Create Tag & Publish GitHub Release (6 Executables)
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.semver.outputs.new_tag }}
+          name: "Release ${{ steps.semver.outputs.new_tag }} (Go & Rust Cross-Platform Binaries)"
+          target_commitish: ${{ github.sha }}
           files: release-assets/*
           generate_release_notes: true

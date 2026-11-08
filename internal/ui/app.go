@@ -24,46 +24,12 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-func init() {
-	// Normalizza locale "C" / "C.UTF-8" / "POSIX" per prevenire "Error parsing user locale C" in Fyne
-	for _, env := range []string{"LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"} {
-		val := os.Getenv(env)
-		if val == "C" || val == "POSIX" || strings.HasPrefix(val, "C.") || strings.HasPrefix(val, "POSIX.") {
-			_ = os.Setenv(env, "en_US.UTF-8")
-		}
-	}
-
-	// Su Linux/WSL, assicura la configurazione XDG user dirs per prevenire "does not define a VIDEOS folder"
-	if runtime.GOOS == "linux" {
-		if home, err := os.UserHomeDir(); err == nil {
-			for _, folder := range []string{"Videos", "Music", "Pictures", "Documents", "Downloads", "Desktop"} {
-				_ = os.MkdirAll(filepath.Join(home, folder), 0755)
-			}
-			xdgConfig := filepath.Join(home, ".config")
-			userDirsFile := filepath.Join(xdgConfig, "user-dirs.dirs")
-			if _, err := os.Stat(userDirsFile); os.IsNotExist(err) {
-				_ = os.MkdirAll(xdgConfig, 0755)
-				content := fmt.Sprintf(`XDG_DESKTOP_DIR="$HOME/Desktop"
-XDG_DOWNLOAD_DIR="$HOME/Downloads"
-XDG_TEMPLATES_DIR="$HOME/Templates"
-XDG_PUBLICSHARE_DIR="$HOME/Public"
-XDG_DOCUMENTS_DIR="$HOME/Documents"
-XDG_MUSIC_DIR="$HOME/Music"
-XDG_PICTURES_DIR="$HOME/Pictures"
-XDG_VIDEOS_DIR="$HOME/Videos"
-`)
-				_ = os.WriteFile(userDirsFile, []byte(content), 0644)
-			}
-		}
-	}
-}
-
 func Run() {
-	a := app.NewWithID("it.secureusb.explorer.v4")
+	a := app.NewWithID("it.secureusb.explorer.v5")
 	a.Settings().SetTheme(NewSecureCyberTheme())
 
-	w := a.NewWindow(fmt.Sprintf("🔐 SecureUSB Explorer — SVAULT03 (%d Core) • Treemap • Dual-Vault • BLAKE3 • ECC", runtime.NumCPU()))
-	w.Resize(fyne.NewSize(1320, 780))
+	w := a.NewWindow(fmt.Sprintf("🔐 SecureUSB Explorer v0.5 — SVAULT03 (%d Core) • Drag-In/Out • Treemap • Dual-Vault • ECC", runtime.NumCPU()))
+	w.Resize(fyne.NewSize(1340, 800))
 
 	showUnlockScreen(w)
 	w.ShowAndRun()
@@ -145,7 +111,7 @@ func showUnlockScreen(w fyne.Window) {
 				drives := usb.DetectUSBDrives()
 				if len(drives) != lastCount {
 					lastCount = len(drives)
-					fyne.Do(refreshDrives)
+					refreshDrives()
 				}
 			}
 		}
@@ -312,7 +278,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	savingsBar.Min = 0
 	savingsBar.Max = 100
 
-	infoLabel := widget.NewLabel("Seleziona un file dalla lista, clicca un blocco della Treemap o rilascia file con Drag & Drop.")
+	infoLabel := widget.NewLabel("Trascina un file/cartella fuori dalla finestra per esportarlo sul Desktop, oppure cliccalo per aprirlo.")
 
 	editor := widget.NewMultiLineEntry()
 	editor.SetPlaceHolder("Editor di testo integrato in RAM.")
@@ -343,8 +309,8 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			return
 		}
 
-		infoLabel.SetText(fmt.Sprintf("📄 %s  |  Reale: %s  |  Su USB: %s  |  Chunk 4MB: %d",
-			e.VirtualPath, formatBytes(e.OriginalSize), formatBytes(e.DiskSize), len(e.ChunkSizes)))
+		infoLabel.SetText(fmt.Sprintf("📄 %s  |  Reale: %s  |  Su USB: %s  |  Trascinalo fuori per esportarlo sul Desktop",
+			e.VirtualPath, formatBytes(e.OriginalSize), formatBytes(e.DiskSize)))
 
 		if isImageExt(e.VirtualPath) {
 			if imgView, err := buildImagePreview(v, e.VirtualPath); err == nil {
@@ -369,7 +335,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 
 		if e.OriginalSize > vault.MaxTextPreviewSize {
 			editor.Disable()
-			editor.SetText(fmt.Sprintf("[File Multimediale / Grande (%s in %d chunk da 4 MB).\n• Clicca 'Stream Video' per riprodurlo subito in O(1) senza file temporanei.\n• Oppure clicca 'Treemap Spazio' per tornare alla mappa grafica.]",
+			editor.SetText(fmt.Sprintf("[File Multimediale / Grande (%s in %d chunk da 4 MB).\n• Clicca 'Stream Video' per riprodurlo subito in O(1).\n• Trascinalo fuori dalla finestra per esportarlo sul Desktop.]",
 				formatBytes(e.OriginalSize), len(e.ChunkSizes)))
 			return
 		}
@@ -391,7 +357,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			editor.SetText(string(data))
 		} else {
 			editor.Disable()
-			editor.SetText("[File binario — Usa 'Stream Video', 'Monta FUSE' o 'App Esterna']")
+			editor.SetText("[File binario — Usa 'Stream Video', 'Monta FUSE' o trascinalo fuori per esportarlo]")
 		}
 	}
 
@@ -457,7 +423,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			infoLabel.SetText(fmt.Sprintf("🔍 Ricerca RAM per %q: %d risultati trovati", q, len(entries)))
 		} else {
 			entries = v.ListDir(currentDir)
-			infoLabel.SetText(fmt.Sprintf("📂 %d elementi in %s  —  [Mappa Treemap interattiva a destra]", len(entries), currentDir))
+			infoLabel.SetText(fmt.Sprintf("📂 %d elementi in %s  —  [Drag-In & Drag-Out verso Desktop attivi]", len(entries), currentDir))
 		}
 		selectedEntry = nil
 		editor.SetText("")
@@ -488,17 +454,16 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 						unmountFuse = nil
 					}
 					v.Close()
-					fyne.Do(func() {
-						showUnlockScreen(w)
-						dialog.ShowInformation("🔒 Blocco di Emergenza Attivato",
-							"La chiavetta USB è stata rimossa: la chiave crittografica in RAM è stata azzerata automaticamente.", w)
-					})
+					showUnlockScreen(w)
+					dialog.ShowInformation("🔒 Blocco di Emergenza Attivato",
+						"La chiavetta USB è stata rimossa: la chiave crittografica in RAM è stata azzerata automaticamente.", w)
 					return
 				}
 			}
 		}
 	}()
 
+	// Drag-In (Dal Sistema Operativo dentro la finestra)
 	w.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
 		if len(uris) == 0 {
 			return
@@ -554,36 +519,43 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 				prog.SetValue(float64(idx+1) / float64(len(uris)))
 			}
 
-			fyne.Do(func() {
-				prog.Hide()
-				refreshList()
-				if lastErr != nil {
-					dialog.ShowError(lastErr, w)
-				} else {
-					dialog.ShowInformation("Drag & Drop Completato",
-						fmt.Sprintf("Importati e cifrati %d file in '%s'!", totalImported, currentDir), w)
-				}
-			})
+			prog.Hide()
+			refreshList()
+			if lastErr != nil {
+				dialog.ShowError(lastErr, w)
+			} else {
+				dialog.ShowInformation("Drag & Drop Completato",
+					fmt.Sprintf("Importati e cifrati %d file in '%s'!", totalImported, currentDir), w)
+			}
 		}()
 	})
 
+	// Lista file/cartelle con supporto Outbound Drag-to-Export (DraggableFileRow)
 	listWidget = widget.NewList(
 		func() int { return len(entries) },
 		func() fyne.CanvasObject {
-			icon := widget.NewIcon(theme.FileIcon())
-			name := widget.NewLabelWithStyle("Nome File", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-			meta := widget.NewLabel("Dimensioni")
-			return container.NewBorder(nil, nil, icon, meta, name)
+			return NewDraggableFileRow(
+				func(tappedEntry vault.FileEntry) {
+					openFileEntry(tappedEntry)
+				},
+				func(dragStatus string) {
+					infoLabel.SetText(dragStatus)
+				},
+				func(draggedEntry vault.FileEntry, _ fyne.Position) {
+					selectedEntry = &draggedEntry
+					triggerDragOutExport(w, v, draggedEntry, getDesktopDir(), true, func(msg string) {
+						infoLabel.SetText(msg)
+					})
+				},
+			)
 		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
 			if i >= len(entries) {
 				return
 			}
 			e := entries[i]
-			box := o.(*fyne.Container)
-			icon := box.Objects[1].(*widget.Icon)
-			meta := box.Objects[2].(*widget.Label)
-			name := box.Objects[0].(*widget.Label)
+			row := o.(*DraggableFileRow)
+			row.Entry = e
 
 			displayName := filepath.Base(e.VirtualPath)
 			if strings.TrimSpace(searchEntry.Text) != "" {
@@ -591,33 +563,26 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			}
 
 			if e.IsDir {
-				icon.SetResource(theme.FolderIcon())
-				name.SetText(displayName + "/")
-				meta.SetText("📁 Cartella")
+				row.IconWidget.SetResource(theme.FolderIcon())
+				row.NameLabel.SetText(displayName + "/")
+				row.MetaLabel.SetText("📁 Trascina per Export")
 			} else {
 				if isImageExt(displayName) {
-					icon.SetResource(theme.MediaPhotoIcon())
+					row.IconWidget.SetResource(theme.MediaPhotoIcon())
 				} else if isPDFExt(displayName) {
-					icon.SetResource(theme.FileTextIcon())
+					row.IconWidget.SetResource(theme.FileTextIcon())
 				} else {
-					icon.SetResource(theme.DocumentIcon())
+					row.IconWidget.SetResource(theme.DocumentIcon())
 				}
-				name.SetText(displayName)
+				row.NameLabel.SetText(displayName)
 				ratio := 100.0
 				if e.OriginalSize > 0 {
 					ratio = (float64(e.DiskSize) / float64(e.OriginalSize)) * 100
 				}
-				meta.SetText(fmt.Sprintf("%s ➔ %s (%.0f%%)", formatBytes(e.OriginalSize), formatBytes(e.DiskSize), ratio))
+				row.MetaLabel.SetText(fmt.Sprintf("%s ➔ %s (%.0f%%)", formatBytes(e.OriginalSize), formatBytes(e.DiskSize), ratio))
 			}
 		},
 	)
-
-	listWidget.OnSelected = func(id widget.ListItemID) {
-		if id < 0 || id >= len(entries) {
-			return
-		}
-		openFileEntry(entries[id])
-	}
 
 	upBtn := widget.NewButtonWithIcon("Su", theme.NavigateBackIcon(), func() {
 		if currentDir == "/" {
@@ -709,14 +674,12 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 						prog.SetValue(float64(done) / float64(total))
 					}
 				})
-				fyne.Do(func() {
-					prog.Hide()
-					if err != nil {
-						dialog.ShowError(err, w)
-						return
-					}
-					refreshList()
-				})
+				prog.Hide()
+				if err != nil {
+					dialog.ShowError(err, w)
+					return
+				}
+				refreshList()
 			}()
 		}, w)
 		fd.Show()
@@ -735,19 +698,17 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			go func() {
 				count, impErr := v.ImportDir(folderPath, currentDir, func(done, total int64) {
 					if total > 0 {
-						fyne.Do(func() { prog.SetValue(float64(done) / float64(total)) })
+						prog.SetValue(float64(done) / float64(total))
 					}
 				})
-				fyne.Do(func() {
-					prog.Hide()
-					if impErr != nil {
-						dialog.ShowError(impErr, w)
-						return
-					}
-					dialog.ShowInformation("Cartella Importata",
-						fmt.Sprintf("Importati e cifrati %d file!", count), w)
-					refreshList()
-				})
+				prog.Hide()
+				if impErr != nil {
+					dialog.ShowError(impErr, w)
+					return
+				}
+				dialog.ShowInformation("Cartella Importata",
+					fmt.Sprintf("Importati e cifrati %d file!", count), w)
+				refreshList()
 			}()
 		}, w)
 	})
@@ -849,15 +810,14 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 					err = bw.Flush()
 				}
 				_ = outFile.Close()
-				fyne.Do(func() {
-					prog.Hide()
-					if err != nil {
-						_ = os.Remove(destPath)
-						dialog.ShowError(err, w)
-					} else {
-						dialog.ShowInformation("Esportazione Completata", "File decifrato e verificato con successo!", w)
-					}
-				})
+				prog.Hide()
+
+				if err != nil {
+					_ = os.Remove(destPath)
+					dialog.ShowError(err, w)
+				} else {
+					dialog.ShowInformation("Esportazione Completata", "File decifrato e verificato con successo!", w)
+				}
 			}()
 		}, w)
 		fs.SetFileName(filepath.Base(entry.VirtualPath))
@@ -882,18 +842,16 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 			go func() {
 				count, expErr := v.ExportDir(targetVirtualDir, destParent, func(done, total int64) {
 					if total > 0 {
-						fyne.Do(func() { prog.SetValue(float64(done) / float64(total)) })
+						prog.SetValue(float64(done) / float64(total))
 					}
 				})
-				fyne.Do(func() {
-					prog.Hide()
-					if expErr != nil {
-						dialog.ShowError(expErr, w)
-						return
-					}
-					dialog.ShowInformation("Cartella Esportata",
-						fmt.Sprintf("Esportati e verificati %d file in %s!", count, destParent), w)
-				})
+				prog.Hide()
+				if expErr != nil {
+					dialog.ShowError(expErr, w)
+					return
+				}
+				dialog.ShowInformation("Cartella Esportata",
+					fmt.Sprintf("Esportati e verificati %d file in %s!", count, destParent), w)
 			}()
 		}, w)
 	})
@@ -928,17 +886,15 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 					prog.SetValue(float64(done) / float64(total))
 				}
 			})
-			fyne.Do(func() {
-				prog.Hide()
-				if len(rep.CorruptedFiles) == 0 {
-					dialog.ShowInformation("Integrità Certificata (100%)",
-						fmt.Sprintf("File verificati: %d\nChunk da 4MB autenticati: %d\nDati controllati: %s\nNessun bit-rot o manomissione rilevata!",
-							rep.TotalFiles, rep.VerifiedChunks, formatBytes(rep.VerifiedBytes)), w)
-				} else {
-					dialog.ShowError(fmt.Errorf("rilevati %d file corrotti: %v",
-						len(rep.CorruptedFiles), strings.Join(rep.CorruptedFiles, ", ")), w)
-				}
-			})
+			prog.Hide()
+			if len(rep.CorruptedFiles) == 0 {
+				dialog.ShowInformation("Integrità Certificata (100%)",
+					fmt.Sprintf("File verificati: %d\nChunk da 4MB autenticati: %d\nDati controllati: %s\nNessun bit-rot o manomissione rilevata!",
+						rep.TotalFiles, rep.VerifiedChunks, formatBytes(rep.VerifiedBytes)), w)
+			} else {
+				dialog.ShowError(fmt.Errorf("rilevati %d file corrotti: %v",
+					len(rep.CorruptedFiles), strings.Join(rep.CorruptedFiles, ", ")), w)
+			}
 		}()
 	})
 
@@ -981,6 +937,15 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 		showUnlockScreen(w)
 	})
 
+	exportDock := buildOutboundExportDock(w, v, func() *vault.FileEntry {
+		if selectedEntry != nil {
+			return selectedEntry
+		}
+		return &vault.FileEntry{VirtualPath: currentDir, IsDir: true}
+	}, func(status string) {
+		infoLabel.SetText(status)
+	})
+
 	topBar := container.NewVBox(
 		container.NewHScroll(container.NewHBox(
 			upBtn, treemapBtn, newFolderBtn, newFileBtn,
@@ -995,7 +960,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 
 	bottomStatusBar := container.NewVBox(
 		widget.NewSeparator(),
-		container.NewBorder(nil, nil, telemetryLabel, nil, savingsBar),
+		container.NewBorder(nil, nil, telemetryLabel, exportDock, savingsBar),
 	)
 
 	rightPane := container.NewBorder(
@@ -1005,7 +970,7 @@ func showExplorerScreen(w fyne.Window, v *vault.SecureVault) {
 	)
 
 	split := container.NewHSplit(listWidget, rightPane)
-	split.Offset = 0.34
+	split.Offset = 0.35
 
 	refreshList()
 	w.SetContent(container.NewBorder(topBar, bottomStatusBar, nil, nil, split))
@@ -1053,43 +1018,42 @@ func openWithSystemAppStreaming(w fyne.Window, v *vault.SecureVault, entry vault
 			err = bw.Flush()
 		}
 		_ = outFile.Close()
-		fyne.Do(func() {
-			prog.Hide()
-			if err != nil {
-				vault.SecureEraseFile(tmpFile)
-				_ = os.RemoveAll(tmpDir)
-				dialog.ShowError(err, w)
-				return
-			}
+		prog.Hide()
 
-			infoBefore, _ := os.Stat(tmpFile)
-			openURLOrFileInOS(tmpFile)
+		if err != nil {
+			vault.SecureEraseFile(tmpFile)
+			_ = os.RemoveAll(tmpDir)
+			dialog.ShowError(err, w)
+			return
+		}
 
-			dialog.ShowConfirm("File Aperto nell'App Esterna",
-				"Quando hai terminato le modifiche, clicca 'Salva e Chiudi' per ricifrare in parallelo le modifiche sulla USB e distruggere il file temporaneo.",
-				func(saveChanges bool) {
-					if saveChanges {
-						infoAfter, statErr := os.Stat(tmpFile)
-						if statErr == nil && (infoBefore == nil || !infoAfter.ModTime().Equal(infoBefore.ModTime()) || infoAfter.Size() != infoBefore.Size()) {
-							inFile, openErr := os.Open(tmpFile)
-							if openErr == nil {
-								saveProg := dialog.NewProgress("Salvataggio Parallelo", "Ricifratura modifiche sulla USB...", w)
-								saveProg.Show()
-								_ = v.WriteStream(entry.VirtualPath, inFile, infoAfter.Size(), func(d, t int64) {
-									if t > 0 {
-										fyne.Do(func() { saveProg.SetValue(float64(d) / float64(t)) })
-									}
-								})
-								_ = inFile.Close()
-								saveProg.Hide()
-							}
+		infoBefore, _ := os.Stat(tmpFile)
+		openURLOrFileInOS(tmpFile)
+
+		dialog.ShowConfirm("File Aperto nell'App Esterna",
+			"Quando hai terminato le modifiche, clicca 'Salva e Chiudi' per ricifrare in parallelo le modifiche sulla USB e distruggere il file temporaneo.",
+			func(saveChanges bool) {
+				if saveChanges {
+					infoAfter, statErr := os.Stat(tmpFile)
+					if statErr == nil && (infoBefore == nil || !infoAfter.ModTime().Equal(infoBefore.ModTime()) || infoAfter.Size() != infoBefore.Size()) {
+						inFile, openErr := os.Open(tmpFile)
+						if openErr == nil {
+							saveProg := dialog.NewProgress("Salvataggio Parallelo", "Ricifratura modifiche sulla USB...", w)
+							saveProg.Show()
+							_ = v.WriteStream(entry.VirtualPath, inFile, infoAfter.Size(), func(d, t int64) {
+								if t > 0 {
+									saveProg.SetValue(float64(d) / float64(t))
+								}
+							})
+							_ = inFile.Close()
+							saveProg.Hide()
 						}
 					}
-					vault.SecureEraseFile(tmpFile)
-					_ = os.RemoveAll(tmpDir)
-					onDone()
-				}, w)
-		})
+				}
+				vault.SecureEraseFile(tmpFile)
+				_ = os.RemoveAll(tmpDir)
+				onDone()
+			}, w)
 	}()
 }
 

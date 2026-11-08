@@ -2,24 +2,14 @@
 
 All notable changes to **SecureHUB** are documented in this file.
 
+## [v0.5.0] — 2026-11-08
+### Added
+- **Outbound Drag-to-Export (Files & Folders):** Added ability to drag files and folders out of the GUI (via outer-border drop or the interactive 3-slot Export Dock) directly to the OS `Desktop`, a chosen folder, or the native OS File Clipboard (`CF_HDROP` on Windows, `POSIX file` on macOS, `text/uri-list` on Linux) for instant `Ctrl+V` pasting in File Explorer.
+- **Interactive Disk Space Treemap:** Added *WinDirStat / DaisyDisk*-style BSP Treemap view in both Go (`Fyne`) and Rust (`egui`) with color-coded file categories, hover compression tooltips, and click-to-open in RAM.
+- **Full-Bleed Responsive `egui` Layout:** Redesigned the Rust GUI to occupy 100% of the window viewport (`auto_shrink([false, false])` and 2-column full-height unlock dashboard).
+- **Automated Per-Commit Semantic Versioning CI/CD:** Updated GitHub Actions (`release.yml`) to automatically bump semantic version tags (`v0.5.X`) and publish all 6 executables on every push to `main`/`master`.
+- **Developer Handbook (`DEVELOPERS.md`):** Added deep technical documentation for contributors covering internals, wire compatibility, CGO/FUSE headers, and the outbound drag bridge.
+
 ## [v0.4.0] — 2026-11-07
 ### Added
-- **Plausible Deniability (`SVKEY04` Dual-Slot + `index.shadow`):** Added hidden second vault unlocked with a separate secret password; unconfigured slots are filled with CSPRNG noise for mathematical indistinguishability.
-- **Content-Addressed Deduplication (`BLAKE3` Keyed):** Added 4 MB chunk deduplication (`WriteStreamDedup` / `write_stream_dedup`) using `BLAKE3_Keyed(DEK, chunk)` and per-chunk reference counting.
-- **Anti Bit-Rot Self-Healing (`RSECC01` Reed-Solomon $\text{GF}(2^8)$):** Added '.ecc' parity sidecars (8 data + 4 Cauchy parity shards + `SHA-256`) with automatic Gauss-Jordan healing for `index.meta`, `index.shadow`, and `vault.key`.
-- **Instant Password Change (Key Wrapping) & Global `Poly1305` Scrubbing:** Added millisecond password rotation and full-drive multi-core integrity scrubbing.
-- **Cross-Platform USB Auto-Detection & Emergency Unplug Panic Lock:** Added automatic USB volume discovery, hot-plug polling, and immediate RAM key zeroization upon physical USB removal.
-- **Recursive Folder Import/Export, Drag & Drop & OS Junk Filter:** Added folder tree import/export, native GUI Drag & Drop, and automatic filtering of '.DS_Store', `Thumbs.db`, `desktop.ini`, `._*`, `~$*`, and `*.tmp`.
-- **Cyber-Dark UI, Instant RAM Search, Breadcrumbs & Async Loading Spinners:** Added `SecureCyberTheme`, sub-millisecond RAM search bar, interactive breadcrumb navigation, compression telemetry bar, and animated busy modals.
-
-## [v0.3.0] — 2026-11-07
-### Added
-- **Protocol `SVAULT03`:** Added `ChunkSizes []uint32` metadata table for $O(1)$ random-access video streaming (`HTTP 206 Range`), FUSE/WinFsp virtual disk mounting, zero-temp RAM viewers for images/PDFs, and the **Rust** (`rayon` + `SIMD` + `Zeroize`) edition.
-
-## [v0.2.0] — 2026-11-07
-### Added
-- **Protocol `SVAULT02`:** Introduced 4 MB streaming chunked AEAD construction (`STREAM`).
-
-## [v0.1.0] — 2026-11-07
-### Added
-- Initial cross-platform USB `exFAT` formatter and `SVAULT01` encrypted VFS in Go.
+- **Plausible Deniability (`SVKEY04` Dual-Slot + `index.shadow`)**, **Content-Addressed Deduplication (`BLAKE3` Keyed)**, **Anti Bit-Rot Self-Healing (`RSECC01` Reed-Solomon $\text{GF}(2^8)$)**, **Key Wrapping**, **Global `Poly1305` Scrubbing**, **USB Auto-Detection**, and **Inbound Drag & Drop**.

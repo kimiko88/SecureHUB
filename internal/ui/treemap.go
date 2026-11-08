@@ -21,27 +21,24 @@ type treemapNode struct {
 	w, h  float32
 }
 
-// Categorizzazione cromatica per estensione file
 func classifyFileColor(path string) (string, color.NRGBA) {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".mp4", ".mkv", ".mov", ".avi", ".webm", ".mp3", ".flac", ".wav":
-		return "Media/Video", color.NRGBA{R: 139, G: 92, B: 246, A: 235} // Violet (#8B5CF6)
+		return "Media/Video", color.NRGBA{R: 139, G: 92, B: 246, A: 235}
 	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg":
-		return "Immagine", color.NRGBA{R: 16, G: 185, B: 129, A: 235} // Emerald (#10B981)
+		return "Immagine", color.NRGBA{R: 16, G: 185, B: 129, A: 235}
 	case ".pdf", ".doc", ".docx", ".txt", ".md", ".rtf", ".odt":
-		return "Documento", color.NRGBA{R: 244, G: 63, B: 94, A: 235} // Rose (#F43F5E)
+		return "Documento", color.NRGBA{R: 244, G: 63, B: 94, A: 235}
 	case ".go", ".rs", ".py", ".js", ".ts", ".c", ".cpp", ".h", ".json", ".sql", ".toml", ".yaml":
-		return "Codice/Dati", color.NRGBA{R: 6, G: 182, B: 212, A: 235} // Cyan (#06B6D4)
+		return "Codice/Dati", color.NRGBA{R: 6, G: 182, B: 212, A: 235}
 	case ".zip", ".tar", ".gz", ".zst", ".7z", ".rar", ".iso", ".img", ".dmg":
-		return "Archivio/ISO", color.NRGBA{R: 245, G: 158, B: 11, A: 235} // Amber (#F59E0B)
+		return "Archivio/ISO", color.NRGBA{R: 245, G: 158, B: 11, A: 235}
 	default:
-		return "Binario", color.NRGBA{R: 99, G: 102, B: 241, A: 235} // Indigo (#6366F1)
+		return "Binario", color.NRGBA{R: 99, G: 102, B: 241, A: 235}
 	}
 }
 
-// computeTreemapBSP suddivide ricorsivamente il rettangolo (x, y, w, h) in modo proporzionale
-// ai pesi dei file usando Binary Space Partitioning bilanciato.
 func computeTreemapBSP(files []vault.FileEntry, x, y, w, h float32, out *[]treemapNode) {
 	if len(files) == 0 || w <= 2 || h <= 2 {
 		return
@@ -111,7 +108,6 @@ func computeTreemapBSP(files []vault.FileEntry, x, y, w, h float32, out *[]treem
 	}
 }
 
-// TreemapCanvas è un widget Fyne interattivo che supporta Hover e Click sui blocchi.
 type TreemapCanvas struct {
 	widget.BaseWidget
 	files     []vault.FileEntry
@@ -230,7 +226,6 @@ func (r *treemapRenderer) Layout(size fyne.Size) {
 		rect.Resize(fyne.NewSize(rw, rh))
 		r.objects = append(r.objects, rect)
 
-		// Disegna etichetta nome file e dimensione se il blocco è abbastanza capiente
 		if rw > 54 && rh > 24 {
 			name := filepath.Base(n.entry.VirtualPath)
 			maxChars := int(rw / 7.5)
@@ -254,7 +249,7 @@ func (r *treemapRenderer) Layout(size fyne.Size) {
 }
 
 func (r *treemapRenderer) MinSize() fyne.Size {
-	return fyne.NewSize(360, 280)
+	return fyne.NewSize(360, 260)
 }
 
 func (r *treemapRenderer) Refresh() {
@@ -268,7 +263,6 @@ func (r *treemapRenderer) Objects() []fyne.CanvasObject {
 
 func (r *treemapRenderer) Destroy() {}
 
-// buildTreemapView costruisce il pannello Treemap completo di legenda colori e barra interattiva.
 func buildTreemapView(
 	v *vault.SecureVault,
 	scopeDir string,
@@ -278,19 +272,33 @@ func buildTreemapView(
 	files := v.AllFiles(scopeDir)
 
 	var totalOrig, totalDisk int64
+	catTotals := make(map[string]int64)
 	for _, f := range files {
 		totalOrig += f.OriginalSize
 		totalDisk += f.DiskSize
+		cat, _ := classifyFileColor(f.VirtualPath)
+		catTotals[cat] += f.OriginalSize
+	}
+
+	var breakdownParts []string
+	for _, cat := range []string{"Media/Video", "Immagine", "Documento", "Codice/Dati", "Archivio/ISO", "Binario"} {
+		if sz := catTotals[cat]; sz > 0 {
+			pct := (float64(sz) / float64(totalOrig)) * 100
+			breakdownParts = append(breakdownParts, fmt.Sprintf("%s: %s (%.0f%%)", cat, formatBytes(sz), pct))
+		}
+	}
+	donutSummary := "🍩 Ripartizione Categorie: " + strings.Join(breakdownParts, "  •  ")
+	if len(breakdownParts) == 0 {
+		donutSummary = "🍩 Ripartizione Categorie: Nessun file presente"
 	}
 
 	title := widget.NewLabelWithStyle(
-		fmt.Sprintf("🗺️ Mappa Spazio Disco (Treemap): %s  —  %d file (%s reali ➔ %s su USB)",
+		fmt.Sprintf("🗺️ Dashboard Spazio Disco (Donut + Sparkline + Treemap): %s  —  %d file (%s ➔ %s)",
 			scopeDir, len(files), formatBytes(totalOrig), formatBytes(totalDisk)),
 		fyne.TextAlignLeading, fyne.TextStyle{Bold: true},
 	)
 
-	legend := widget.NewLabel("🟣 Media/Video   🟢 Immagini   🔴 PDF/Documenti   🔵 Codice/Dati   🟠 Archivi/ISO   🟣 Binari   (Clicca un blocco per aprirlo)")
-
+	legend := widget.NewLabel(donutSummary)
 	tCanvas := NewTreemapCanvas(files, onHover, onSelectFile)
 	header := container.NewVBox(title, legend, widget.NewSeparator())
 

@@ -3459,6 +3459,7 @@ dependencies = [
  "chrono",
  "criterion",
  "eframe",
+ "flate2",
  "fuser",
  "hex",
  "image",

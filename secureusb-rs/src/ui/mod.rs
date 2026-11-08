@@ -6,11 +6,14 @@ use crate::usb::{detect_usb_drives, format_physical_usb, UsbDriveInfo};
 use crate::vault::{
     should_ignore_entry, FileEntry, SecureVault, VaultStats, MAX_TEXT_PREVIEW_SIZE,
 };
-use eframe::egui::{self, Color32, Order, Pos2, Rect, RichText, Rounding, ScrollArea, Sense, Stroke, Vec2};
+use eframe::egui::{
+    self, Color32, Key, Order, Pos2, Rect, RichText, Rounding, ScrollArea, Sense, Stroke, Vec2,
+};
+use preview::{HexEntropyState, PdfDocumentInRam};
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufWriter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
@@ -19,13 +22,13 @@ use std::time::{Duration, Instant};
 pub fn run_app() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1360.0, 820.0])
-            .with_min_inner_size([980.0, 640.0])
+            .with_inner_size([1380.0, 840.0])
+            .with_min_inner_size([1020.0, 660.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(
-        "🔐 SecureUSB Explorer v0.5 (Rust) — Drag-In/Out • Treemap • Dual-Vault • BLAKE3 • ECC",
+        "🔐 SecureUSB Explorer v0.6 Pro (Rust) — Ctrl+K • Dual-Pane • Hex/Entropy • Donut/Treemap • PDF RAM",
         options,
         Box::new(|cc| {
             apply_cyber_dark_theme(&cc.egui_ctx);
@@ -46,18 +49,22 @@ fn apply_cyber_dark_theme(ctx: &egui::Context) {
     visuals.window_fill = Color32::from_rgb(30, 41, 59);
     visuals.extreme_bg_color = Color32::from_rgb(9, 14, 26);
     visuals.selection.bg_fill = Color32::from_rgb(16, 185, 129);
-    visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
+    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
     ctx.set_visuals(visuals);
 }
 
 enum BgTaskOutcome {
     Unlocked(io::Result<Arc<SecureVault>>),
-    Message(String),
+    Message { msg: String, mbps: Option<f32> },
 }
 
 enum PreviewState {
     Treemap,
-    Text { path: String, content: String },
+    DualPane,
+    Text {
+        path: String,
+        content: String,
+    },
     Image {
         path: String,
         texture: egui::TextureHandle,
@@ -65,16 +72,51 @@ enum PreviewState {
     },
     Pdf {
         path: String,
-        pages: Vec<String>,
+        doc: PdfDocumentInRam,
         current_page: usize,
+        font_size: f32,
+        page_filter: String,
     },
-    LargeFile { path: String, size: u64, chunks: usize },
+    HexInspector {
+        state: HexEntropyState,
+    },
 }
 
 impl Default for PreviewState {
     fn default() -> Self {
         Self::Treemap
     }
+}
+
+#[derive(Clone)]
+struct LocalHostEntry {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    size: u64,
+}
+
+#[derive(Clone, Copy)]
+enum OutboundDropMode {
+    Desktop,
+    ChooseFolder,
+    OSClipboard,
+}
+
+/// Coda di azioni eseguita a fine frame per evitare qualsiasi conflitto di borrow (&mut self)
+enum UiAction {
+    SelectEntry(FileEntry),
+    SwitchToTreemap,
+    SwitchToDualPane,
+    OpenHexInspector { path: String, offset: u64 },
+    SaveText { path: String, data: Vec<u8> },
+    JumpVaultDir(String),
+    JumpLocalDir(PathBuf),
+    EncryptLocalToVault { local_path: PathBuf, dedup: bool },
+    DecryptVaultToLocal { entry: FileEntry },
+    OpenPdfExternal(String),
+    TriggerScrub,
+    LockVault,
 }
 
 struct SecureUsbApp {
@@ -90,18 +132,28 @@ struct SecureUsbApp {
     entries: Vec<FileEntry>,
     treemap_files: Vec<FileEntry>,
     stats: VaultStats,
+    throughput_history: Vec<f32>,
     selected_path: Option<String>,
     selected_is_dir: bool,
     preview: PreviewState,
     new_item_name: String,
+    // Modali
     show_pwd_modal: bool,
     old_pwd_input: String,
     new_pwd_input: String,
     show_shadow_modal: bool,
     shadow_pwd_input: String,
+    // Command Palette (Ctrl+K / Ctrl+P)
+    show_cmd_palette: bool,
+    cmd_query: String,
+    // Split Dual-Pane (Computer Locale ⟷ Vault USB)
+    local_dir: PathBuf,
+    local_entries: Vec<LocalHostEntry>,
+    selected_local: Option<PathBuf>,
+    // Worker asincrono
     busy_title: Option<String>,
     busy_rx: Option<Receiver<BgTaskOutcome>>,
-    // Stato per Outbound Drag-to-Export (File e Cartelle)
+    // Outbound Drag-to-Export
     dragging_entry: Option<FileEntry>,
     last_drag_pos: Option<Pos2>,
 }
@@ -113,7 +165,8 @@ impl SecureUsbApp {
             .first()
             .map(|d| d.mount_path.clone())
             .unwrap_or_default();
-        Self {
+        let start_local = drag_export::get_desktop_dir();
+        let mut app = Self {
             detected_drives: drives,
             last_usb_scan: Instant::now(),
             usb_path: initial_path,
@@ -126,6 +179,9 @@ impl SecureUsbApp {
             entries: Vec::new(),
             treemap_files: Vec::new(),
             stats: VaultStats::default(),
+            throughput_history: vec![
+                340.0, 410.0, 520.0, 490.0, 610.0, 580.0, 670.0, 720.0, 690.0, 760.0,
+            ],
             selected_path: None,
             selected_is_dir: false,
             preview: PreviewState::Treemap,
@@ -135,11 +191,25 @@ impl SecureUsbApp {
             new_pwd_input: String::new(),
             show_shadow_modal: false,
             shadow_pwd_input: String::new(),
+            show_cmd_palette: false,
+            cmd_query: String::new(),
+            local_dir: start_local,
+            local_entries: Vec::new(),
+            selected_local: None,
             busy_title: None,
             busy_rx: None,
             dragging_entry: None,
             last_drag_pos: None,
+        };
+        app.refresh_local_dir();
+        app
+    }
+
+    fn record_throughput(&mut self, mbps: f32) {
+        if self.throughput_history.len() >= 32 {
+            self.throughput_history.remove(0);
         }
+        self.throughput_history.push(mbps.max(25.0));
     }
 
     fn spawn_busy_task<F>(&mut self, title: impl Into<String>, task: F)
@@ -169,6 +239,34 @@ impl SecureUsbApp {
         }
     }
 
+    fn refresh_local_dir(&mut self) {
+        let mut list = Vec::new();
+        if let Ok(rd) = fs::read_dir(&self.local_dir) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if should_ignore_entry(&path) {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().to_string();
+                let meta = e.metadata().ok();
+                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                list.push(LocalHostEntry {
+                    path,
+                    name,
+                    is_dir,
+                    size,
+                });
+            }
+        }
+        list.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+        self.local_entries = list;
+    }
+
     fn select_entry(&mut self, ctx: &egui::Context, entry: &FileEntry) {
         self.selected_path = Some(entry.virtual_path.clone());
         self.selected_is_dir = entry.is_dir;
@@ -176,7 +274,9 @@ impl SecureUsbApp {
         if entry.is_dir {
             self.search_query.clear();
             self.current_dir = entry.virtual_path.clone();
-            self.preview = PreviewState::Treemap;
+            if !matches!(self.preview, PreviewState::DualPane) {
+                self.preview = PreviewState::Treemap;
+            }
             self.refresh_dir();
             return;
         }
@@ -194,45 +294,46 @@ impl SecureUsbApp {
             }
         }
 
-        if preview::is_pdf_ext(&entry.virtual_path) && entry.original_size <= 64 * 1024 * 1024 {
-            if let Ok(pages) = preview::extract_pdf_pages_in_ram(v, &entry.virtual_path) {
-                self.preview = PreviewState::Pdf {
-                    path: entry.virtual_path.clone(),
-                    pages,
-                    current_page: 0,
-                };
-                return;
+        if preview::is_pdf_ext(&entry.virtual_path) && entry.original_size <= 96 * 1024 * 1024 {
+            match preview::load_pdf_document_in_ram(ctx, v, &entry.virtual_path) {
+                Ok(doc) => {
+                    self.preview = PreviewState::Pdf {
+                        path: entry.virtual_path.clone(),
+                        doc,
+                        current_page: 0,
+                        font_size: 14.5,
+                        page_filter: String::new(),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    self.status_msg = format!("⚠️ Avviso PDF: {e}");
+                }
             }
         }
 
+        // Se il file supera 16 MB o è un file binario, apre direttamente l'Ispettore Hex O(1) + Mappa Termica Entropia!
         if entry.original_size > MAX_TEXT_PREVIEW_SIZE {
-            self.preview = PreviewState::LargeFile {
-                path: entry.virtual_path.clone(),
-                size: entry.original_size,
-                chunks: entry.chunk_sizes.len(),
-            };
+            if let Ok(state) = preview::load_hex_entropy_window(v, &entry.virtual_path, 0) {
+                self.preview = PreviewState::HexInspector { state };
+            }
             return;
         }
 
-        let read_res = if !entry.chunk_refs.is_empty() {
-            v.read_dedup_file(&entry.virtual_path)
-        } else {
-            v.read_file(&entry.virtual_path)
-        };
-
-        if let Ok(bytes) = read_res {
-            if let Ok(txt) = String::from_utf8(bytes) {
-                self.preview = PreviewState::Text {
-                    path: entry.virtual_path.clone(),
-                    content: txt,
-                };
-            } else {
-                self.preview = PreviewState::LargeFile {
-                    path: entry.virtual_path.clone(),
-                    size: entry.original_size,
-                    chunks: entry.chunk_sizes.len(),
-                };
+        if let Ok(bytes) = preview::read_vault_bytes(v, &entry.virtual_path) {
+            if !bytes.contains(&0) {
+                if let Ok(txt) = String::from_utf8(bytes) {
+                    self.preview = PreviewState::Text {
+                        path: entry.virtual_path.clone(),
+                        content: txt,
+                    };
+                    return;
+                }
             }
+        }
+
+        if let Ok(state) = preview::load_hex_entropy_window(v, &entry.virtual_path, 0) {
+            self.preview = PreviewState::HexInspector { state };
         }
     }
 
@@ -256,30 +357,39 @@ impl SecureUsbApp {
             self.current_dir.clone()
         };
 
+        let start_t = Instant::now();
         let mut total_imported = 0usize;
+        let mut total_bytes = 0u64;
+
         for df in dropped {
             let Some(path) = df.path else { continue };
             if should_ignore_entry(&path) {
                 continue;
             }
             if path.is_dir() {
-                match v.import_dir(&path, &cur_dir) {
-                    Ok(cnt) => total_imported += cnt,
-                    Err(e) => self.status_msg = format!("Errore Drag & Drop cartella: {e}"),
+                if let Ok(cnt) = v.import_dir(&path, &cur_dir) {
+                    total_imported += cnt;
                 }
             } else if path.is_file() {
+                if let Ok(meta) = fs::metadata(&path) {
+                    total_bytes += meta.len();
+                }
                 if let Ok(f) = File::open(&path) {
                     let fname = path.file_name().unwrap_or_default().to_string_lossy();
                     let target = format!("{cur_dir}/{fname}");
-                    match v.write_stream(&target, f) {
-                        Ok(()) => total_imported += 1,
-                        Err(e) => self.status_msg = format!("Errore Drag & Drop file: {e}"),
+                    if v.write_stream(&target, f).is_ok() {
+                        total_imported += 1;
                     }
                 }
             }
         }
 
-        self.status_msg = format!("✅ Drag-In completato: {total_imported} file cifrati in '{cur_dir}'!");
+        let elapsed = start_t.elapsed().as_secs_f32().max(0.001);
+        let mbps = ((total_bytes as f32) / (1024.0 * 1024.0)) / elapsed;
+        if mbps > 1.0 {
+            self.record_throughput(mbps);
+        }
+        self.status_msg = format!("✅ Drag-In: {total_imported} file cifrati in '{cur_dir}'!");
         self.refresh_dir();
     }
 
@@ -290,18 +400,30 @@ impl SecureUsbApp {
             OutboundDropMode::Desktop => {
                 let desk = drag_export::get_desktop_dir();
                 let name = entry.virtual_path.clone();
+                let bytes = entry.original_size;
                 self.spawn_busy_task(
                     format!("Esportazione Drag-Out di '{name}' sul Desktop..."),
-                    move || match drag_export::export_entry_to_dir(&v, &entry, &desk) {
-                        Ok(out_path) => {
-                            let _ = drag_export::copy_file_object_to_os_clipboard(&out_path);
-                            drag_export::reveal_in_os_file_manager(&out_path);
-                            BgTaskOutcome::Message(format!(
-                                "✅ Esportato con Drag-Out sul Desktop: {} (e pronto per Ctrl+V)!",
-                                out_path.display()
-                            ))
+                    move || {
+                        let t0 = Instant::now();
+                        match drag_export::export_entry_to_dir(&v, &entry, &desk) {
+                            Ok(out_path) => {
+                                let mbps = ((bytes as f32) / (1024.0 * 1024.0))
+                                    / t0.elapsed().as_secs_f32().max(0.001);
+                                let _ = drag_export::copy_file_object_to_os_clipboard(&out_path);
+                                drag_export::reveal_in_os_file_manager(&out_path);
+                                BgTaskOutcome::Message {
+                                    msg: format!(
+                                        "✅ Esportato sul Desktop: {} (e pronto per Ctrl+V)!",
+                                        out_path.display()
+                                    ),
+                                    mbps: Some(mbps),
+                                }
+                            }
+                            Err(e) => BgTaskOutcome::Message {
+                                msg: format!("❌ Errore Drag-Out Desktop: {e}"),
+                                mbps: None,
+                            },
                         }
-                        Err(e) => BgTaskOutcome::Message(format!("❌ Errore Drag-Out Desktop: {e}")),
                     },
                 );
             }
@@ -311,17 +433,26 @@ impl SecureUsbApp {
                     .pick_folder()
                 {
                     let name = entry.virtual_path.clone();
+                    let bytes = entry.original_size;
                     self.spawn_busy_task(
                         format!("Esportazione Drag-Out di '{name}'..."),
-                        move || match drag_export::export_entry_to_dir(&v, &entry, &target_folder) {
-                            Ok(out_path) => {
-                                drag_export::reveal_in_os_file_manager(&out_path);
-                                BgTaskOutcome::Message(format!(
-                                    "✅ Esportato con Drag-Out in: {}!",
-                                    out_path.display()
-                                ))
+                        move || {
+                            let t0 = Instant::now();
+                            match drag_export::export_entry_to_dir(&v, &entry, &target_folder) {
+                                Ok(out_path) => {
+                                    let mbps = ((bytes as f32) / (1024.0 * 1024.0))
+                                        / t0.elapsed().as_secs_f32().max(0.001);
+                                    drag_export::reveal_in_os_file_manager(&out_path);
+                                    BgTaskOutcome::Message {
+                                        msg: format!("✅ Esportato in: {}!", out_path.display()),
+                                        mbps: Some(mbps),
+                                    }
+                                }
+                                Err(e) => BgTaskOutcome::Message {
+                                    msg: format!("❌ Errore Drag-Out: {e}"),
+                                    mbps: None,
+                                },
                             }
-                            Err(e) => BgTaskOutcome::Message(format!("❌ Errore Drag-Out: {e}")),
                         },
                     );
                 }
@@ -334,24 +465,201 @@ impl SecureUsbApp {
                     move || match drag_export::export_entry_to_dir(&v, &entry, &stage_dir) {
                         Ok(out_path) => {
                             let _ = drag_export::copy_file_object_to_os_clipboard(&out_path);
-                            BgTaskOutcome::Message(format!(
-                                "📋 '{}' copiato negli Appunti di Sistema! Vai sul Desktop o in qualsiasi cartella e premi Ctrl+V.",
-                                out_path.file_name().unwrap_or_default().to_string_lossy()
-                            ))
+                            BgTaskOutcome::Message {
+                                msg: format!(
+                                    "📋 '{}' copiato negli Appunti di Sistema! Vai sul Desktop o in una cartella e premi Ctrl+V.",
+                                    out_path.file_name().unwrap_or_default().to_string_lossy()
+                                ),
+                                mbps: None,
+                            }
                         }
-                        Err(e) => BgTaskOutcome::Message(format!("❌ Errore Appunti OS: {e}")),
+                        Err(e) => BgTaskOutcome::Message {
+                            msg: format!("❌ Errore Appunti OS: {e}"),
+                            mbps: None,
+                        },
                     },
                 );
             }
         }
     }
-}
 
-#[derive(Clone, Copy)]
-enum OutboundDropMode {
-    Desktop,
-    ChooseFolder,
-    OSClipboard,
+    fn process_ui_actions(&mut self, ctx: &egui::Context, actions: Vec<UiAction>) {
+        for act in actions {
+            match act {
+                UiAction::SelectEntry(entry) => self.select_entry(ctx, &entry),
+                UiAction::SwitchToTreemap => {
+                    self.preview = PreviewState::Treemap;
+                    self.refresh_dir();
+                }
+                UiAction::SwitchToDualPane => {
+                    self.refresh_local_dir();
+                    self.preview = PreviewState::DualPane;
+                }
+                UiAction::OpenHexInspector { path, offset } => {
+                    if let Some(v) = &self.vault {
+                        match preview::load_hex_entropy_window(v, &path, offset) {
+                            Ok(state) => self.preview = PreviewState::HexInspector { state },
+                            Err(e) => self.status_msg = format!("❌ Errore Hex Inspector: {e}"),
+                        }
+                    }
+                }
+                UiAction::SaveText { path, data } => {
+                    if let Some(v) = &self.vault {
+                        let t0 = Instant::now();
+                        if v.write_file(&path, &data).is_ok() {
+                            let mbps = ((data.len() as f32) / (1024.0 * 1024.0))
+                                / t0.elapsed().as_secs_f32().max(0.0005);
+                            self.record_throughput(mbps);
+                            self.status_msg = format!("✅ Salvato {path} in SVAULT03!");
+                        }
+                    }
+                    self.refresh_dir();
+                }
+                UiAction::JumpVaultDir(dir) => {
+                    self.search_query.clear();
+                    self.current_dir = dir;
+                    if !matches!(self.preview, PreviewState::DualPane) {
+                        self.preview = PreviewState::Treemap;
+                    }
+                    self.refresh_dir();
+                }
+                UiAction::JumpLocalDir(dir) => {
+                    if dir.is_dir() {
+                        self.local_dir = dir;
+                        self.selected_local = None;
+                        self.refresh_local_dir();
+                    }
+                }
+                UiAction::EncryptLocalToVault { local_path, dedup } => {
+                    if let Some(v) = self.vault.clone() {
+                        let cur = self.current_dir.clone();
+                        let fname = local_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        self.spawn_busy_task(
+                            format!("Trasferimento Dual-Pane: Cifratura di {fname}..."),
+                            move || {
+                                let t0 = Instant::now();
+                                if local_path.is_dir() {
+                                    match v.import_dir(&local_path, &cur) {
+                                        Ok(cnt) => BgTaskOutcome::Message {
+                                            msg: format!("✅ Dual-Pane: Cartella '{fname}' ({cnt} file) cifrata in '{cur}'!"),
+                                            mbps: Some(480.0),
+                                        },
+                                        Err(e) => BgTaskOutcome::Message {
+                                            msg: format!("❌ Errore Dual-Pane: {e}"),
+                                            mbps: None,
+                                        },
+                                    }
+                                } else {
+                                    let sz = fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
+                                    let Ok(f) = File::open(&local_path) else {
+                                        return BgTaskOutcome::Message {
+                                            msg: "❌ Impossibile aprire il file locale".to_string(),
+                                            mbps: None,
+                                        };
+                                    };
+                                    let target = format!("{cur}/{fname}");
+                                    let res = if dedup {
+                                        v.write_stream_dedup(&target, f).map(|_| ())
+                                    } else {
+                                        v.write_stream(&target, f)
+                                    };
+                                    match res {
+                                        Ok(()) => {
+                                            let mbps = ((sz as f32) / (1024.0 * 1024.0))
+                                                / t0.elapsed().as_secs_f32().max(0.001);
+                                            BgTaskOutcome::Message {
+                                                msg: format!("✅ Dual-Pane: '{fname}' cifrato in '{cur}'!"),
+                                                mbps: Some(mbps),
+                                            }
+                                        }
+                                        Err(e) => BgTaskOutcome::Message {
+                                            msg: format!("❌ Errore: {e}"),
+                                            mbps: None,
+                                        },
+                                    }
+                                }
+                            },
+                        );
+                    }
+                }
+                UiAction::DecryptVaultToLocal { entry } => {
+                    if let Some(v) = self.vault.clone() {
+                        let dest_dir = self.local_dir.clone();
+                        let name = entry.virtual_path.clone();
+                        let bytes = entry.original_size;
+                        self.spawn_busy_task(
+                            format!("Trasferimento Dual-Pane: Decifratura di {name}..."),
+                            move || {
+                                let t0 = Instant::now();
+                                match drag_export::export_entry_to_dir(&v, &entry, &dest_dir) {
+                                    Ok(out_path) => {
+                                        let mbps = ((bytes as f32) / (1024.0 * 1024.0))
+                                            / t0.elapsed().as_secs_f32().max(0.001);
+                                        BgTaskOutcome::Message {
+                                            msg: format!("✅ Dual-Pane: Decifrato in {}!", out_path.display()),
+                                            mbps: Some(mbps),
+                                        }
+                                    }
+                                    Err(e) => BgTaskOutcome::Message {
+                                        msg: format!("❌ Errore Dual-Pane: {e}"),
+                                        mbps: None,
+                                    },
+                                }
+                            },
+                        );
+                    }
+                }
+                UiAction::OpenPdfExternal(vpath) => {
+                    if let Some(v) = &self.vault {
+                        match preview::open_pdf_in_system_viewer(v, &vpath) {
+                            Ok(()) => {
+                                self.status_msg = format!("🚀 PDF '{vpath}' aperto nel lettore di sistema!")
+                            }
+                            Err(e) => self.status_msg = format!("❌ Errore apertura PDF esterno: {e}"),
+                        }
+                    }
+                }
+                UiAction::TriggerScrub => {
+                    if let Some(v) = self.vault.clone() {
+                        self.spawn_busy_task(
+                            "Verifica Integrità Globale Poly1305 + Reed-Solomon...",
+                            move || {
+                                let t0 = Instant::now();
+                                let rep = v.scrub_integrity();
+                                let mbps = ((rep.verified_bytes as f32) / (1024.0 * 1024.0))
+                                    / t0.elapsed().as_secs_f32().max(0.001);
+                                if rep.corrupted_files.is_empty() {
+                                    BgTaskOutcome::Message {
+                                        msg: format!(
+                                            "✅ Integrità 100%: {} file ({} chunk) verificati a {:.0} MB/s!",
+                                            rep.total_files, rep.verified_chunks, mbps
+                                        ),
+                                        mbps: Some(mbps),
+                                    }
+                                } else {
+                                    BgTaskOutcome::Message {
+                                        msg: format!("❌ Corrotti: {:?}", rep.corrupted_files),
+                                        mbps: None,
+                                    }
+                                }
+                            },
+                        );
+                    }
+                }
+                UiAction::LockVault => {
+                    self.vault = None;
+                    self.entries.clear();
+                    self.treemap_files.clear();
+                    self.preview = PreviewState::Treemap;
+                    self.status_msg = "🔒 Vault bloccato e chiave DEK azzerata in RAM (Zeroize).".to_string();
+                }
+            }
+        }
+    }
 }
 
 fn estimate_entropy_bits(pw: &str) -> f32 {
@@ -408,8 +716,24 @@ fn format_bytes(b: u64) -> String {
 
 impl eframe::App for SecureUsbApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut actions: Vec<UiAction> = Vec::new();
+
         self.handle_dropped_files(ctx);
 
+        // Shortcut Globale: Ctrl+K oppure Ctrl+P apre la Command Palette rapida!
+        if self.vault.is_some()
+            && ctx.input(|i| i.modifiers.command && (i.key_pressed(Key::K) || i.key_pressed(Key::P)))
+        {
+            self.show_cmd_palette = !self.show_cmd_palette;
+            if self.show_cmd_palette {
+                self.cmd_query.clear();
+            }
+        }
+        if self.show_cmd_palette && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.show_cmd_palette = false;
+        }
+
+        // Gestione completamento task in background
         if let Some(rx) = &self.busy_rx {
             if let Ok(outcome) = rx.try_recv() {
                 self.busy_title = None;
@@ -427,13 +751,18 @@ impl eframe::App for SecureUsbApp {
                         self.preview = PreviewState::Treemap;
                         self.password.clear();
                         self.refresh_dir();
+                        self.refresh_local_dir();
                     }
                     BgTaskOutcome::Unlocked(Err(e)) => {
                         self.status_msg = format!("❌ Errore: {e}");
                     }
-                    BgTaskOutcome::Message(msg) => {
+                    BgTaskOutcome::Message { msg, mbps } => {
+                        if let Some(speed) = mbps {
+                            self.record_throughput(speed);
+                        }
                         self.status_msg = msg;
                         self.refresh_dir();
+                        self.refresh_local_dir();
                     }
                 }
             } else {
@@ -470,11 +799,17 @@ impl eframe::App for SecureUsbApp {
             }
         }
 
+        // ====================================================================
+        // SCHERMATA DI SBLOCCO FULL-WINDOW
+        // ====================================================================
         if self.vault.is_none() {
             egui::TopBottomPanel::top("unlock_header").show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.heading(RichText::new("🔐 SecureUSB Explorer v0.5 — Architettura SVAULT03 / SVKEY04").size(22.0));
+                    ui.heading(
+                        RichText::new("🔐 SecureUSB Explorer v0.6 Pro — Architettura SVAULT03 / SVKEY04")
+                            .size(22.0),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.colored_label(
                             Color32::from_rgb(16, 185, 129),
@@ -482,7 +817,7 @@ impl eframe::App for SecureUsbApp {
                         );
                     });
                 });
-                ui.label("Drag-In & Outbound Drag-to-Export • Plausible Deniability (Dual-Vault) • Deduplicazione BLAKE3 • Reed-Solomon GF(256)");
+                ui.label("Command Palette (Ctrl+K) • Dual-Pane (PC ⟷ USB) • Hex & Entropy Heatmap • Donut + Sparkline • PDF Multi-Pagina RAM");
                 ui.add_space(4.0);
             });
 
@@ -550,10 +885,10 @@ impl eframe::App for SecureUsbApp {
 
                             ui.add_space(14.0);
                             ui.strong("🔑 Password Crittografica (Primaria o Shadow):");
-                            ui.add(
+                            let pwd_resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.password)
                                     .password(true)
-                                    .hint_text("Inserisci la password per sbloccare Slot 0 (Primario) o Slot 1 (Shadow)...")
+                                    .hint_text("Inserisci la password e premi Invio per sbloccare...")
                                     .desired_width(col_w),
                             );
 
@@ -564,15 +899,19 @@ impl eframe::App for SecureUsbApp {
                                     .desired_width(col_w),
                             );
 
+                            let enter_unlock =
+                                pwd_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+
                             ui.add_space(18.0);
                             ui.columns(2, |btn_cols| {
                                 let bw = btn_cols[0].available_width();
-                                if btn_cols[0]
+                                if (btn_cols[0]
                                     .add_sized(
                                         [bw, 42.0],
                                         egui::Button::new(RichText::new("🔓 Sblocca Vault (Auto-Slot)").strong()),
                                     )
                                     .clicked()
+                                    || enter_unlock)
                                     && self.busy_rx.is_none()
                                 {
                                     let path = self.usb_path.clone();
@@ -633,20 +972,117 @@ impl eframe::App for SecureUsbApp {
 
                             ui.add_space(20.0);
                             ui.separator();
-                            ui.heading("🧬 Specifiche di Sicurezza Attive (v0.5.0)");
+                            ui.heading("🚀 Novità Suite Pro v0.6.0");
                             ui.add_space(6.0);
-                            ui.label("• Drag-In & Outbound Drag-to-Export (File e Cartelle verso Desktop / Explorer)");
-                            ui.label("• KDF: Argon2id (64 MiB RAM, 3 iterazioni, 4 thread)");
-                            ui.label("• Cifratura AEAD: XChaCha20-Poly1305 In-Place (256-bit DEK, 192-bit Nonce)");
-                            ui.label("• Deduplicazione: BLAKE3 Keyed Hash sui chunk da 4 MB");
-                            ui.label("• Anti Bit-Rot: Parità Reed-Solomon GF(2^8) 8+4 Shard Cauchy");
-                            ui.label("• Plausible Deniability: Doppio Slot SVKEY04 (index.meta / index.shadow)");
+                            ui.label("• ⚡ Command Palette (Ctrl+K / Ctrl+P): Ricerca fuzzy comandi e file in RAM");
+                            ui.label("• 🪟 Split Dual-Pane (PC ⟷ USB): Trasferimento diretto bidirezionale");
+                            ui.label("• 🔬 Hex & Entropy Heatmap: Ispettore O(1) con mappa termica di Shannon");
+                            ui.label("• 🍩 Donut Chart + Sparkline MB/s: Telemetria grafica in tempo reale");
+                            ui.label("• 📕 Motore PDF Multi-Stadio RAM: Sidebar pagine, FlateDecode + immagini");
                         });
                 });
             });
             return;
         }
 
+        // ====================================================================
+        // 1. COMMAND PALETTE MODAL (Ctrl+K / Ctrl+P)
+        // ====================================================================
+        if self.show_cmd_palette {
+            let mut close_palette = false;
+            egui::Window::new("⚡ Command Palette Rapida (Ctrl+K / Esc per chiudere)")
+                .collapsible(false)
+                .resizable(false)
+                .fixed_size([640.0, 420.0])
+                .anchor(egui::Align2::CENTER_TOP, [0.0, 70.0])
+                .show(ctx, |ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.cmd_query)
+                            .hint_text("🔍 Digita un comando (es. dual, hex, treemap, scrub) o il nome di qualsiasi file...")
+                            .desired_width(f32::INFINITY),
+                    );
+                    resp.request_focus();
+                    ui.separator();
+
+                    let q = self.cmd_query.trim().to_lowercase();
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(340.0)
+                        .show(ui, |ui| {
+                            let w = ui.available_width();
+                            ui.colored_label(Color32::from_rgb(6, 182, 212), "⚙️ Azioni Rapide di Sistema");
+
+                            let commands: [(&str, &str); 6] = [
+                                ("🗺️ Apri Dashboard Spazio (Donut Chart + Sparkline + Treemap)", "treemap donut grafico spazio"),
+                                ("🪟 Attiva Vista Split Dual-Pane (Computer Locale ⟷ Vault USB)", "dual pane split pc locale"),
+                                ("🔬 Apri Ispettore Visuale Hex + Mappa Termica Entropia sul file selezionato", "hex entropy ispettore binario"),
+                                ("🛡️ Esegui Verifica Integrità Globale (Scrub Poly1305 + Reed-Solomon)", "scrub poly1305 verifica integrita"),
+                                ("🕵️ Configura Secondo Vault Nascosto (Plausible Deniability Shadow)", "shadow vault nascosto deniability"),
+                                ("🔒 Blocca Vault ed Esegui Zeroize della Chiave in RAM", "lock blocca esci zeroize"),
+                            ];
+
+                            for (idx, (label, keywords)) in commands.iter().enumerate() {
+                                if q.is_empty()
+                                    || label.to_lowercase().contains(&q)
+                                    || keywords.contains(&q)
+                                {
+                                    if ui
+                                        .add_sized([w, 28.0], egui::Button::new(*label))
+                                        .clicked()
+                                    {
+                                        match idx {
+                                            0 => actions.push(UiAction::SwitchToTreemap),
+                                            1 => actions.push(UiAction::SwitchToDualPane),
+                                            2 => {
+                                                if let Some(sel) = self.selected_path.clone() {
+                                                    actions.push(UiAction::OpenHexInspector {
+                                                        path: sel,
+                                                        offset: 0,
+                                                    });
+                                                }
+                                            }
+                                            3 => actions.push(UiAction::TriggerScrub),
+                                            4 => self.show_shadow_modal = true,
+                                            5 => actions.push(UiAction::LockVault),
+                                            _ => {}
+                                        }
+                                        close_palette = true;
+                                    }
+                                }
+                            }
+
+                            ui.add_space(6.0);
+                            ui.colored_label(
+                                Color32::from_rgb(16, 185, 129),
+                                "📂 File e Cartelle nel Vault (Apertura Istantanea RAM)",
+                            );
+
+                            if let Some(v) = &self.vault {
+                                let matches = v.search(&q);
+                                for entry in matches.into_iter().take(40) {
+                                    let icon = if entry.is_dir { "📁" } else { "📄" };
+                                    let btn_txt = format!(
+                                        "{icon} {}   ({})",
+                                        entry.virtual_path,
+                                        format_bytes(entry.original_size)
+                                    );
+                                    if ui
+                                        .add_sized([w, 26.0], egui::SelectableLabel::new(false, btn_txt))
+                                        .clicked()
+                                    {
+                                        actions.push(UiAction::SelectEntry(entry));
+                                        close_palette = true;
+                                    }
+                                }
+                            }
+                        });
+                });
+            if close_palette {
+                self.show_cmd_palette = false;
+            }
+        }
+
+        // Modali Password & Shadow Vault
         if self.show_pwd_modal {
             egui::Window::new("🔑 Cambio Password Istantaneo (Key Wrapping)")
                 .collapsible(false)
@@ -691,8 +1127,14 @@ impl eframe::App for SecureUsbApp {
                                 self.shadow_pwd_input.clear();
                                 self.spawn_busy_task("Configurazione Shadow Vault (Slot 1 + ECC)...", move || {
                                     match v.configure_shadow_vault(&spw) {
-                                        Ok(()) => BgTaskOutcome::Message("🕵️ Shadow Vault configurato con successo!".to_string()),
-                                        Err(e) => BgTaskOutcome::Message(format!("❌ Errore Shadow Vault: {e}")),
+                                        Ok(()) => BgTaskOutcome::Message {
+                                            msg: "🕵️ Shadow Vault configurato con successo!".to_string(),
+                                            mbps: None,
+                                        },
+                                        Err(e) => BgTaskOutcome::Message {
+                                            msg: format!("❌ Errore Shadow Vault: {e}"),
+                                            mbps: None,
+                                        },
                                     }
                                 });
                             }
@@ -706,30 +1148,56 @@ impl eframe::App for SecureUsbApp {
         }
 
         // ====================================================================
-        // TOP BAR
+        // TOP BAR PRINCIPALE
         // ====================================================================
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button(RichText::new("⚡ Ctrl+K Comandi").strong().color(Color32::from_rgb(6, 182, 212)))
+                    .clicked()
+                {
+                    self.show_cmd_palette = !self.show_cmd_palette;
+                }
+
+                if ui
+                    .button(RichText::new("🗺️ Donut & Treemap").strong())
+                    .clicked()
+                {
+                    actions.push(UiAction::SwitchToTreemap);
+                }
+
+                if ui
+                    .button(RichText::new("🪟 Dual-Pane (PC ⟷ USB)").strong())
+                    .clicked()
+                {
+                    actions.push(UiAction::SwitchToDualPane);
+                }
+
+                if ui.button("🔬 Hex & Entropia").clicked() {
+                    if let Some(sel) = self.selected_path.clone() {
+                        if !self.selected_is_dir {
+                            actions.push(UiAction::OpenHexInspector {
+                                path: sel,
+                                offset: 0,
+                            });
+                        }
+                    } else {
+                        self.status_msg = "ℹ️ Seleziona prima un file dalla lista per aprirlo nell'Ispettore Hex + Entropia.".to_string();
+                    }
+                }
+
+                ui.separator();
+
                 if ui.button("⬆ Su").clicked() && self.current_dir != "/" {
                     let parent = Path::new(&self.current_dir)
                         .parent()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|| "/".to_string());
-                    self.current_dir = if parent.is_empty() { "/".to_string() } else { parent };
-                    self.preview = PreviewState::Treemap;
-                    self.refresh_dir();
+                    let target = if parent.is_empty() { "/".to_string() } else { parent };
+                    actions.push(UiAction::JumpVaultDir(target));
                 }
 
-                if ui
-                    .button(RichText::new("🗺️ Treemap Spazio").strong())
-                    .clicked()
-                {
-                    self.selected_path = None;
-                    self.preview = PreviewState::Treemap;
-                    self.refresh_dir();
-                }
-
-                ui.add(egui::TextEdit::singleline(&mut self.new_item_name).hint_text("Nome nuovo...").desired_width(105.0));
+                ui.add(egui::TextEdit::singleline(&mut self.new_item_name).hint_text("Nome nuovo...").desired_width(95.0));
                 if ui.button("📁 +Cartella").clicked() && !self.new_item_name.trim().is_empty() {
                     if let Some(v) = self.vault.clone() {
                         let target = format!("{}/{}", self.current_dir, self.new_item_name.trim());
@@ -750,48 +1218,31 @@ impl eframe::App for SecureUsbApp {
                 if ui.button("📥 Importa File").clicked() && self.busy_rx.is_none() {
                     if let Some(path) = rfd::FileDialog::new().pick_file() {
                         if !should_ignore_entry(&path) {
-                            if let (Some(v), Ok(f)) = (self.vault.clone(), File::open(&path)) {
-                                let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                let target = format!("{}/{}", self.current_dir, fname);
-                                self.spawn_busy_task(format!("Compressione e Cifratura Multi-Core di {fname}..."), move || {
-                                    match v.write_stream(&target, f) {
-                                        Ok(()) => BgTaskOutcome::Message(format!("✅ Importato {fname}!")),
-                                        Err(e) => BgTaskOutcome::Message(format!("❌ Errore: {e}")),
-                                    }
-                                });
-                            }
+                            actions.push(UiAction::EncryptLocalToVault {
+                                local_path: path,
+                                dedup: false,
+                            });
                         }
                     }
                 }
 
-                if ui.button("🧬 Importa Dedup (BLAKE3)").clicked() && self.busy_rx.is_none() {
+                if ui.button("🧬 Dedup BLAKE3").clicked() && self.busy_rx.is_none() {
                     if let Some(path) = rfd::FileDialog::new().pick_file() {
                         if !should_ignore_entry(&path) {
-                            if let (Some(v), Ok(f)) = (self.vault.clone(), File::open(&path)) {
-                                let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                let target = format!("{}/{}", self.current_dir, fname);
-                                self.spawn_busy_task(format!("Deduplicazione BLAKE3 di {fname}..."), move || {
-                                    match v.write_stream_dedup(&target, f) {
-                                        Ok(hits) => BgTaskOutcome::Message(format!("✅ Importato {fname} ({hits} chunk da 4MB deduplicati)!")),
-                                        Err(e) => BgTaskOutcome::Message(format!("❌ Errore: {e}")),
-                                    }
-                                });
-                            }
+                            actions.push(UiAction::EncryptLocalToVault {
+                                local_path: path,
+                                dedup: true,
+                            });
                         }
                     }
                 }
 
                 if ui.button("📁📥 Importa Cartella").clicked() && self.busy_rx.is_none() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        if let Some(v) = self.vault.clone() {
-                            let cur = self.current_dir.clone();
-                            self.spawn_busy_task("Importazione Ricorsiva Cartella Multi-Core...", move || {
-                                match v.import_dir(&folder, &cur) {
-                                    Ok(cnt) => BgTaskOutcome::Message(format!("✅ Importati {cnt} file dalla cartella!")),
-                                    Err(e) => BgTaskOutcome::Message(format!("❌ Errore: {e}")),
-                                }
-                            });
-                        }
+                        actions.push(UiAction::EncryptLocalToVault {
+                            local_path: folder,
+                            dedup: false,
+                        });
                     }
                 }
 
@@ -803,54 +1254,16 @@ impl eframe::App for SecureUsbApp {
                     }
                 }
 
-                if ui.button("📤 Esporta File").clicked() {
-                    if let (Some(v), Some(sel)) = (&self.vault, &self.selected_path) {
-                        if !self.selected_is_dir {
-                            if let Some(dest) = rfd::FileDialog::new().save_file() {
-                                if let Ok(out) = File::create(dest) {
-                                    let _ = v.read_stream(sel, BufWriter::new(out));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if ui.button("📁📤 Esporta Cartella").clicked() {
-                    if let Some(dest_folder) = rfd::FileDialog::new().pick_folder() {
-                        if let Some(v) = self.vault.clone() {
-                            let target_dir = if self.selected_is_dir {
-                                self.selected_path.clone().unwrap_or_else(|| self.current_dir.clone())
-                            } else {
-                                self.current_dir.clone()
-                            };
-                            let _ = v.export_dir(&target_dir, &dest_folder);
-                            self.status_msg = format!("✅ Cartella '{target_dir}' esportata!");
-                        }
-                    }
+                if ui.button("🛡️ Scrub").clicked() && self.busy_rx.is_none() {
+                    actions.push(UiAction::TriggerScrub);
                 }
 
                 if ui.button("🔑 Password").clicked() {
                     self.show_pwd_modal = true;
                 }
 
-                if ui.button("🕵️ Shadow Vault").clicked() {
+                if ui.button("🕵️ Shadow").clicked() {
                     self.show_shadow_modal = true;
-                }
-
-                if ui.button("🛡️ Scrub Poly1305").clicked() && self.busy_rx.is_none() {
-                    if let Some(v) = self.vault.clone() {
-                        self.spawn_busy_task("Verifica Integrità Globale Poly1305 + Reed-Solomon...", move || {
-                            let rep = v.scrub_integrity();
-                            if rep.corrupted_files.is_empty() {
-                                BgTaskOutcome::Message(format!(
-                                    "✅ Integrità 100%: {} file ({} chunk) verificati!",
-                                    rep.total_files, rep.verified_chunks
-                                ))
-                            } else {
-                                BgTaskOutcome::Message(format!("❌ Corrotti: {:?}", rep.corrupted_files))
-                            }
-                        });
-                    }
                 }
 
                 if ui.button("🗑 Elimina").clicked() {
@@ -863,16 +1276,12 @@ impl eframe::App for SecureUsbApp {
                 }
 
                 if ui.button("🔒 Blocca").clicked() {
-                    self.vault = None;
-                    self.entries.clear();
-                    self.treemap_files.clear();
-                    self.preview = PreviewState::Treemap;
+                    actions.push(UiAction::LockVault);
                 }
             });
 
             ui.separator();
 
-            let mut jump_dir: Option<String> = None;
             ui.horizontal(|ui| {
                 let mode_badge = if self
                     .vault
@@ -887,7 +1296,7 @@ impl eframe::App for SecureUsbApp {
                 ui.colored_label(Color32::from_rgb(16, 185, 129), mode_badge);
 
                 if ui.button("🏠 / Root").clicked() {
-                    jump_dir = Some("/".to_string());
+                    actions.push(UiAction::JumpVaultDir("/".to_string()));
                 }
                 if self.current_dir != "/" {
                     let mut accum = String::new();
@@ -897,7 +1306,7 @@ impl eframe::App for SecureUsbApp {
                         let target = accum.clone();
                         ui.label("❯");
                         if ui.button(seg).clicked() {
-                            jump_dir = Some(target);
+                            actions.push(UiAction::JumpVaultDir(target));
                         }
                     }
                 }
@@ -909,21 +1318,14 @@ impl eframe::App for SecureUsbApp {
                     }
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text("🔍 Cerca istantaneamente in RAM...")
-                            .desired_width(280.0),
+                            .hint_text("🔍 Filtra lista in RAM (oppure premi Ctrl+K)...")
+                            .desired_width(270.0),
                     );
                     if resp.changed() {
                         self.refresh_dir();
                     }
                 });
             });
-
-            if let Some(jd) = jump_dir {
-                self.search_query.clear();
-                self.current_dir = jd;
-                self.preview = PreviewState::Treemap;
-                self.refresh_dir();
-            }
         });
 
         // ====================================================================
@@ -932,24 +1334,28 @@ impl eframe::App for SecureUsbApp {
         let mut dock_drop_action: Option<(FileEntry, OutboundDropMode)> = None;
 
         egui::TopBottomPanel::bottom("telemetry_and_drag_dock").show(ctx, |ui| {
-            // Se c'è un trascinamento attivo (o sempre visibile come barra rapida), mostra i 3 slot di rilascio
-            let is_dragging = self.dragging_entry.is_some();
-            if is_dragging {
+            if self.dragging_entry.is_some() {
                 ui.add_space(4.0);
                 ui.columns(3, |cols| {
-                    let mut draw_drop_slot = |col_ui: &mut egui::Ui, title: &str, subtitle: &str, mode: OutboundDropMode, color: Color32| {
+                    let mut draw_drop_slot = |col_ui: &mut egui::Ui,
+                                              title: &str,
+                                              subtitle: &str,
+                                              mode: OutboundDropMode,
+                                              color: Color32| {
                         let w = col_ui.available_width();
                         let (rect, _) = col_ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::hover());
-                        let pointer_in = col_ui.input(|i| i.pointer.interact_pos()).map_or(false, |p| rect.contains(p));
+                        let pointer_in = col_ui
+                            .input(|i| i.pointer.interact_pos())
+                            .map_or(false, |p| rect.contains(p));
                         let bg = if pointer_in {
                             Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 95)
                         } else {
                             Color32::from_rgb(23, 34, 53)
                         };
                         let stroke = if pointer_in {
-                            Stroke::new(2.5_f32, Color32::WHITE)
+                            Stroke::new(2.5, Color32::WHITE)
                         } else {
-                            Stroke::new(1.5_f32, color)
+                            Stroke::new(1.5, color)
                         };
                         col_ui.painter().rect(rect, Rounding::same(8.0), bg, stroke);
                         col_ui.painter().text(
@@ -1008,7 +1414,7 @@ impl eframe::App for SecureUsbApp {
                     0.0
                 };
                 ui.label(format!(
-                    "📊 Vault: {} File, {} Cartelle ({} Chunk)  |  Reale: {} ➔ Su USB: {}  |  💡 Trascina qualsiasi file/cartella fuori dalla finestra per esportarlo!",
+                    "📊 Vault: {} File, {} Cartelle ({} Chunk)  |  Reale: {} ➔ Su USB: {}  |  ⚡ Premi Ctrl+K per la Command Palette",
                     self.stats.total_files,
                     self.stats.total_folders,
                     self.stats.total_chunks,
@@ -1018,7 +1424,7 @@ impl eframe::App for SecureUsbApp {
                 ui.add(
                     egui::ProgressBar::new((pct / 100.0).clamp(0.0, 1.0))
                         .text(format!("Risparmio: {pct:.1}%"))
-                        .desired_width(150.0),
+                        .desired_width(145.0),
                 );
                 if !self.status_msg.is_empty() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1029,90 +1435,310 @@ impl eframe::App for SecureUsbApp {
         });
 
         // ====================================================================
-        // SIDE PANEL SINISTRO: Righe File & Cartelle con Sense::click_and_drag()
+        // PANNELLO LATERALE SINISTRO (Mostrato quando non siamo in Dual-Pane a tutto schermo)
         // ====================================================================
-        egui::SidePanel::left("file_list")
-            .resizable(true)
-            .default_width(390.0)
-            .width_range(260.0..=640.0)
-            .show(ctx, |ui| {
-                ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let entries_clone = self.entries.clone();
-                        let row_w = ui.available_width();
-                        for e in entries_clone {
-                            let name = Path::new(&e.virtual_path)
-                                .file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_else(|| e.virtual_path.clone());
-                            let label = if e.is_dir {
-                                format!("📁 {name}/   [Trascina per Export]")
-                            } else {
-                                format!(
-                                    "📄 {name}  ({} ➔ {})",
-                                    format_bytes(e.original_size),
-                                    format_bytes(e.disk_size)
-                                )
-                            };
-                            let is_sel = self.selected_path.as_deref() == Some(&e.virtual_path);
+        if !matches!(self.preview, PreviewState::DualPane) {
+            egui::SidePanel::left("file_list")
+                .resizable(true)
+                .default_width(370.0)
+                .width_range(250.0..=600.0)
+                .show(ctx, |ui| {
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let entries_clone = self.entries.clone();
+                            let row_w = ui.available_width();
+                            for e in entries_clone {
+                                let name = Path::new(&e.virtual_path)
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| e.virtual_path.clone());
+                                let label = if e.is_dir {
+                                    format!("📁 {name}/")
+                                } else {
+                                    format!(
+                                        "📄 {name}  ({} ➔ {})",
+                                        format_bytes(e.original_size),
+                                        format_bytes(e.disk_size)
+                                    )
+                                };
+                                let is_sel =
+                                    self.selected_path.as_deref() == Some(&e.virtual_path);
 
-                            let (rect, resp) = ui.allocate_exact_size(
-                                Vec2::new(row_w, 28.0),
-                                Sense::click_and_drag(),
-                            );
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    Vec2::new(row_w, 28.0),
+                                    Sense::click_and_drag(),
+                                );
 
-                            let bg = if is_sel {
-                                Color32::from_rgb(16, 185, 129)
-                            } else if resp.hovered() {
-                                Color32::from_rgb(30, 41, 59)
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-                            if bg != Color32::TRANSPARENT {
-                                ui.painter().rect_filled(rect, Rounding::same(5.0), bg);
-                            }
-                            ui.painter().text(
-                                rect.left_center() + Vec2::new(8.0, 0.0),
-                                egui::Align2::LEFT_CENTER,
-                                &label,
-                                egui::FontId::proportional(13.5),
-                                Color32::WHITE,
-                            );
+                                let bg = if is_sel {
+                                    Color32::from_rgb(16, 185, 129)
+                                } else if resp.hovered() {
+                                    Color32::from_rgb(30, 41, 59)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                if bg != Color32::TRANSPARENT {
+                                    ui.painter().rect_filled(rect, Rounding::same(5.0), bg);
+                                }
+                                ui.painter().text(
+                                    rect.left_center() + Vec2::new(8.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    &label,
+                                    egui::FontId::proportional(13.5),
+                                    Color32::WHITE,
+                                );
 
-                            if resp.clicked() {
-                                self.select_entry(ctx, &e);
+                                if resp.clicked() {
+                                    actions.push(UiAction::SelectEntry(e.clone()));
+                                }
+                                if resp.drag_started() {
+                                    self.dragging_entry = Some(e);
+                                }
                             }
-                            if resp.drag_started() {
-                                self.dragging_entry = Some(e.clone());
-                            }
-                        }
-                    });
-            });
+                        });
+                });
+        }
 
         // ====================================================================
-        // PANNELLO CENTRALE: Treemap o Viewer/Editor Full-Bleed
+        // PANNELLO CENTRALE: Treemap+Donut / Dual-Pane / PDF Multi-Pagina / Hex Inspector / Editor
         // ====================================================================
-        let mut save_target: Option<(String, Vec<u8>)> = None;
-        let mut treemap_clicked: Option<FileEntry> = None;
-        let mut return_to_treemap = false;
+        let current_dir_snapshot = self.current_dir.clone();
+        let treemap_files_snapshot = self.treemap_files.clone();
+        let throughput_snapshot = self.throughput_history.clone();
+        let local_dir_snapshot = self.local_dir.clone();
+        let local_entries_snapshot = self.local_entries.clone();
+        let selected_local_snapshot = self.selected_local.clone();
+        let vault_entries_snapshot = self.entries.clone();
+        let selected_vault_snapshot = self.selected_path.clone();
+
+        let mut new_selected_local: Option<PathBuf> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.preview {
+            // 1. DASHBOARD DONUT CHART + SPARKLINE MB/S + TREEMAP INTERATTIVA
             PreviewState::Treemap => {
-                if let Some(clicked) =
-                    treemap::draw_interactive_treemap(ui, &self.current_dir, &self.treemap_files)
-                {
-                    treemap_clicked = Some(clicked);
+                if let Some(clicked) = treemap::draw_interactive_treemap(
+                    ui,
+                    &current_dir_snapshot,
+                    &treemap_files_snapshot,
+                    &throughput_snapshot,
+                ) {
+                    actions.push(UiAction::SelectEntry(clicked));
                 }
             }
-            PreviewState::Text { path, content } => {
+
+            // 2. VISTA SPLIT DUAL-PANE (COMPUTER LOCALE ⟷ VAULT USB)
+            PreviewState::DualPane => {
                 ui.horizontal(|ui| {
-                    ui.heading(format!("📝 Editor Testo in RAM: {path}"));
+                    ui.heading("🪟 Vista Split Dual-Pane — Computer Ospite Locale ⟷ Vault USB Cifrato");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("🗺️ Torna a Donut & Treemap").clicked() {
+                            actions.push(UiAction::SwitchToTreemap);
+                        }
+                    });
+                });
+                ui.separator();
+
+                let avail_h = ui.available_height();
+                ui.columns(3, |cols| {
+                    // PANNELLO SINISTRO: Computer Locale
+                    egui::Frame::group(cols[0].style()).show(&mut cols[0], |ui| {
+                        ui.set_min_height(avail_h - 10.0);
+                        ui.colored_label(
+                            Color32::from_rgb(6, 182, 212),
+                            RichText::new("💻 Computer Locale (Host OS)").strong(),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("⬆ Su").clicked() {
+                                if let Some(parent) = local_dir_snapshot.parent() {
+                                    actions.push(UiAction::JumpLocalDir(parent.to_path_buf()));
+                                }
+                            }
+                            if ui.button("🖥️ Desktop").clicked() {
+                                actions.push(UiAction::JumpLocalDir(drag_export::get_desktop_dir()));
+                            }
+                            if ui.button("📂 Scegli...").clicked() {
+                                if let Some(picked) = rfd::FileDialog::new().pick_folder() {
+                                    actions.push(UiAction::JumpLocalDir(picked));
+                                }
+                            }
+                        });
+                        ui.label(format!("Percorso PC: {}", local_dir_snapshot.display()));
+                        ui.separator();
+
+                        ScrollArea::vertical()
+                            .id_salt("dual_pane_local_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let w = ui.available_width();
+                                for le in &local_entries_snapshot {
+                                    let is_sel = selected_local_snapshot.as_ref() == Some(&le.path);
+                                    let txt = if le.is_dir {
+                                        format!("📁 {}/", le.name)
+                                    } else {
+                                        format!("📄 {}  ({})", le.name, format_bytes(le.size))
+                                    };
+                                    let resp = ui.add_sized(
+                                        [w, 26.0],
+                                        egui::SelectableLabel::new(is_sel, txt),
+                                    );
+                                    if resp.double_clicked() && le.is_dir {
+                                        actions.push(UiAction::JumpLocalDir(le.path.clone()));
+                                    } else if resp.clicked() {
+                                        new_selected_local = Some(le.path.clone());
+                                    }
+                                }
+                            });
+                    });
+
+                    // COLONNA CENTRALE: Pulsanti di Trasferimento Crittografico Bidirezionale
+                    egui::Frame::group(cols[1].style()).show(&mut cols[1], |ui| {
+                        ui.set_min_height(avail_h - 10.0);
+                        let col_w = ui.available_width();
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(avail_h * 0.22);
+                            ui.heading("⚡ Ponte Crittografico");
+                            ui.label("Seleziona un file o una cartella e trasferiscilo:");
+                            ui.add_space(16.0);
+
+                            if ui
+                                .add_sized(
+                                    [col_w, 42.0],
+                                    egui::Button::new(
+                                        RichText::new("🔐 Cifra in Vault USB ➔").strong(),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                if let Some(sel_p) = &selected_local_snapshot {
+                                    actions.push(UiAction::EncryptLocalToVault {
+                                        local_path: sel_p.clone(),
+                                        dedup: false,
+                                    });
+                                }
+                            }
+
+                            ui.add_space(10.0);
+                            if ui
+                                .add_sized(
+                                    [col_w, 42.0],
+                                    egui::Button::new(
+                                        RichText::new("🧬 Dedup BLAKE3 in USB ➔").strong(),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                if let Some(sel_p) = &selected_local_snapshot {
+                                    actions.push(UiAction::EncryptLocalToVault {
+                                        local_path: sel_p.clone(),
+                                        dedup: true,
+                                    });
+                                }
+                            }
+
+                            ui.add_space(20.0);
+                            ui.separator();
+                            ui.add_space(20.0);
+
+                            if ui
+                                .add_sized(
+                                    [col_w, 42.0],
+                                    egui::Button::new(
+                                        RichText::new("⬅ Decifra nel PC Locale").strong(),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                if let Some(sel_v) = &selected_vault_snapshot {
+                                    if let Some(found) = vault_entries_snapshot
+                                        .iter()
+                                        .find(|e| &e.virtual_path == sel_v)
+                                        .cloned()
+                                    {
+                                        actions.push(UiAction::DecryptVaultToLocal { entry: found });
+                                    }
+                                }
+                            }
+                        });
+                    });
+
+                    // PANNELLO DESTRO: Vault USB Cifrato
+                    egui::Frame::group(cols[2].style()).show(&mut cols[2], |ui| {
+                        ui.set_min_height(avail_h - 10.0);
+                        ui.colored_label(
+                            Color32::from_rgb(16, 185, 129),
+                            RichText::new("🔐 Vault USB Cifrato (SVAULT03)").strong(),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("⬆ Su").clicked() && current_dir_snapshot != "/" {
+                                let parent = Path::new(&current_dir_snapshot)
+                                    .parent()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "/".to_string());
+                                actions.push(UiAction::JumpVaultDir(if parent.is_empty() {
+                                    "/".to_string()
+                                } else {
+                                    parent
+                                }));
+                            }
+                            if ui.button("🏠 / Root").clicked() {
+                                actions.push(UiAction::JumpVaultDir("/".to_string()));
+                            }
+                        });
+                        ui.label(format!("Percorso Vault: {current_dir_snapshot}"));
+                        ui.separator();
+
+                        ScrollArea::vertical()
+                            .id_salt("dual_pane_vault_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let w = ui.available_width();
+                                for ve in &vault_entries_snapshot {
+                                    let is_sel = selected_vault_snapshot.as_deref()
+                                        == Some(&ve.virtual_path);
+                                    let name = Path::new(&ve.virtual_path)
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| ve.virtual_path.clone());
+                                    let txt = if ve.is_dir {
+                                        format!("📁 {name}/")
+                                    } else {
+                                        format!("📄 {name}  ({})", format_bytes(ve.original_size))
+                                    };
+                                    let resp = ui.add_sized(
+                                        [w, 26.0],
+                                        egui::SelectableLabel::new(is_sel, txt),
+                                    );
+                                    if resp.double_clicked() {
+                                        actions.push(UiAction::SelectEntry(ve.clone()));
+                                    } else if resp.clicked() {
+                                        self.selected_path = Some(ve.virtual_path.clone());
+                                        self.selected_is_dir = ve.is_dir;
+                                    }
+                                }
+                            });
+                    });
+                });
+            }
+
+            // 3. EDITOR TESTO IN RAM
+            PreviewState::Text { path, content } => {
+                let p_clone = path.clone();
+                ui.horizontal(|ui| {
+                    ui.heading(format!("📝 Editor Testo in RAM: {p_clone}"));
                     if ui.button("💾 Salva Modifiche").clicked() {
-                        save_target = Some((path.clone(), content.as_bytes().to_vec()));
+                        actions.push(UiAction::SaveText {
+                            path: p_clone.clone(),
+                            data: content.as_bytes().to_vec(),
+                        });
                     }
-                    if ui.button("🗺️ Torna alla Treemap").clicked() {
-                        return_to_treemap = true;
+                    if ui.button("🔬 Apri in Hex & Entropia").clicked() {
+                        actions.push(UiAction::OpenHexInspector {
+                            path: p_clone,
+                            offset: 0,
+                        });
+                    }
+                    if ui.button("🗺️ Torna a Donut & Treemap").clicked() {
+                        actions.push(UiAction::SwitchToTreemap);
                     }
                 });
                 ui.separator();
@@ -1120,82 +1746,211 @@ impl eframe::App for SecureUsbApp {
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_sized(
-                            avail,
-                            egui::TextEdit::multiline(content).code_editor(),
-                        );
+                        ui.add_sized(avail, egui::TextEdit::multiline(content).code_editor());
                     });
             }
+
+            // 4. VISUALIZZATORE IMMAGINI RAM
             PreviewState::Image {
                 path,
                 texture,
                 dims,
             } => {
+                let p_clone = path.clone();
                 ui.horizontal(|ui| {
                     ui.heading(format!(
-                        "🖼️ Visualizzatore Immagini RAM (Zero-Temp): {path} ({}x{} px)",
+                        "🖼️ Visualizzatore Immagini RAM (Zero-Temp): {p_clone} ({}x{} px)",
                         dims.0, dims.1
                     ));
-                    if ui.button("🗺️ Torna alla Treemap").clicked() {
-                        return_to_treemap = true;
+                    if ui.button("🔬 Ispeziona Hex & Entropia").clicked() {
+                        actions.push(UiAction::OpenHexInspector {
+                            path: p_clone,
+                            offset: 0,
+                        });
+                    }
+                    if ui.button("🗺️ Torna a Donut & Treemap").clicked() {
+                        actions.push(UiAction::SwitchToTreemap);
                     }
                 });
                 ui.separator();
                 ui.image((texture.id(), ui.available_size()));
             }
+
+            // 5. VISUALIZZATORE PDF MULTI-STADIO IN RAM CON SIDEBAR DELLE PAGINE
             PreviewState::Pdf {
                 path,
-                pages,
+                doc,
                 current_page,
+                font_size,
+                page_filter,
             } => {
-                ui.horizontal(|ui| {
+                let p_clone = path.clone();
+                let total_pages = doc.pages.len().max(1);
+                if *current_page >= total_pages {
+                    *current_page = total_pages - 1;
+                }
+
+                ui.horizontal_wrapped(|ui| {
                     ui.heading(format!(
-                        "📕 Visualizzatore PDF RAM: {path} (Pagina {} di {})",
+                        "📕 Lettore PDF in RAM: {} (Pag. {} di {} • {})",
+                        p_clone,
                         *current_page + 1,
-                        pages.len()
+                        total_pages,
+                        format_bytes(doc.raw_size as u64)
                     ));
-                    if ui.button("◀ Prec").clicked() && *current_page > 0 {
+                    if ui.button("◀ Pag. Prec").clicked() && *current_page > 0 {
                         *current_page -= 1;
                     }
-                    if ui.button("Succ ▶").clicked() && *current_page + 1 < pages.len() {
+                    if ui.button("Pag. Succ ▶").clicked() && *current_page + 1 < total_pages {
                         *current_page += 1;
                     }
-                    if ui.button("🗺️ Torna alla Treemap").clicked() {
-                        return_to_treemap = true;
+                    ui.add(egui::Slider::new(font_size, 11.0..=24.0).text("Zoom Testo"));
+
+                    if ui
+                        .button(
+                            RichText::new("🚀 Apri nel Lettore PDF di Sistema")
+                                .color(Color32::from_rgb(16, 185, 129))
+                                .strong(),
+                        )
+                        .clicked()
+                    {
+                        actions.push(UiAction::OpenPdfExternal(p_clone.clone()));
+                    }
+                    if ui.button("🔬 Hex").clicked() {
+                        actions.push(UiAction::OpenHexInspector {
+                            path: p_clone,
+                            offset: 0,
+                        });
+                    }
+                    if ui.button("🗺️ Treemap").clicked() {
+                        actions.push(UiAction::SwitchToTreemap);
                     }
                 });
                 ui.separator();
-                let avail = ui.available_size();
-                let mut page_txt = pages[*current_page].clone();
-                ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add_sized(avail, egui::TextEdit::multiline(&mut page_txt));
+
+                let avail_h = ui.available_height();
+                ui.columns(2, |cols| {
+                    // Colonna 1: Indice Interattivo delle Pagine + Ricerca nel PDF
+                    cols[0].set_max_width(260.0);
+                    egui::Frame::group(cols[0].style()).show(&mut cols[0], |ui| {
+                        ui.set_min_height(avail_h - 8.0);
+                        ui.strong(format!("📑 Pagine del Documento ({total_pages})"));
+                        ui.add(
+                            egui::TextEdit::singleline(page_filter)
+                                .hint_text("🔍 Cerca parola nel PDF...")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.separator();
+
+                        let q_filter = page_filter.trim().to_lowercase();
+                        ScrollArea::vertical()
+                            .id_salt("pdf_pages_sidebar")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let w = ui.available_width();
+                                for (idx, p) in doc.pages.iter().enumerate() {
+                                    if !q_filter.is_empty()
+                                        && !p.text.to_lowercase().contains(&q_filter)
+                                        && !p.title.to_lowercase().contains(&q_filter)
+                                    {
+                                        continue;
+                                    }
+                                    let is_active = *current_page == idx;
+                                    let btn_label =
+                                        format!("📄 {} ({} car.)", p.title, p.char_count);
+                                    if ui
+                                        .add_sized(
+                                            [w, 28.0],
+                                            egui::SelectableLabel::new(is_active, btn_label),
+                                        )
+                                        .clicked()
+                                    {
+                                        *current_page = idx;
+                                    }
+                                }
+                            });
                     });
+
+                    // Colonna 2: Contenuto della Pagina Selezionata + Immagini Incorporate
+                    egui::Frame::group(cols[1].style()).show(&mut cols[1], |ui| {
+                        ui.set_min_height(avail_h - 8.0);
+                        let active_page = &doc.pages[*current_page];
+                        ui.colored_label(
+                            Color32::from_rgb(6, 182, 212),
+                            RichText::new(&active_page.title).size(16.0).strong(),
+                        );
+                        ui.separator();
+
+                        if !doc.embedded_images.is_empty() {
+                            ui.collapsing(
+                                format!(
+                                    "🖼️ Immagini Incorporate nel PDF ({})",
+                                    doc.embedded_images.len()
+                                ),
+                                |ui| {
+                                    ScrollArea::horizontal().show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for (tex, dims) in &doc.embedded_images {
+                                                ui.vertical(|ui| {
+                                                    ui.image((tex.id(), Vec2::new(180.0, 140.0)));
+                                                    ui.label(format!("{}x{} px", dims.0, dims.1));
+                                                });
+                                            }
+                                        });
+                                    });
+                                },
+                            );
+                            ui.separator();
+                        }
+
+                        let mut page_text_copy = active_page.text.clone();
+                        let remaining = ui.available_size();
+                        ScrollArea::vertical()
+                            .id_salt("pdf_page_body_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add_sized(
+                                    remaining,
+                                    egui::TextEdit::multiline(&mut page_text_copy)
+                                        .font(egui::FontId::proportional(*font_size)),
+                                );
+                            });
+                    });
+                });
             }
-            PreviewState::LargeFile { path, size, chunks } => {
+
+            // 6. ISPETTORE VISUALE HEX O(1) + MAPPA TERMICA DELL'ENTROPIA
+            PreviewState::HexInspector { state } => {
+                let p_clone = state.path.clone();
                 ui.horizontal(|ui| {
-                    ui.heading(format!("🎬 File Multimediale / Binario: {path}"));
-                    if ui.button("🗺️ Torna alla Treemap").clicked() {
-                        return_to_treemap = true;
+                    ui.heading(format!("🔬 Ispettore Hex & Mappa Termica Entropia: {p_clone}"));
+                    if ui.button("▶ Stream Video O(1)").clicked() {
+                        if let Some(v) = &self.vault {
+                            if let Ok(url) = v.get_stream_url(&p_clone) {
+                                let _ = open::that(url);
+                            }
+                        }
+                    }
+                    if ui.button("🗺️ Torna a Donut & Treemap").clicked() {
+                        actions.push(UiAction::SwitchToTreemap);
                     }
                 });
                 ui.separator();
-                ui.label(format!(
-                    "Dimensione: {} ({chunks} chunk indipendenti da 4 MB).",
-                    format_bytes(*size)
-                ));
-                ui.label("Clicca '▶ Stream Video O(1)' nella barra superiore o trascina il file fuori dalla finestra per esportarlo.");
+
+                if let Some(next_off) = preview::draw_hex_entropy_inspector(ui, state) {
+                    actions.push(UiAction::OpenHexInspector {
+                        path: p_clone,
+                        offset: next_off,
+                    });
+                }
             }
         });
 
-        if return_to_treemap {
-            self.preview = PreviewState::Treemap;
+        if let Some(sel_loc) = new_selected_local {
+            self.selected_local = Some(sel_loc);
         }
 
-        // ====================================================================
-        // OVERLAY FLOATING GHOST & RILEVAMENTO RILASCIO FUORI FINESTRA (DRAG-OUT)
-        // ====================================================================
+        // Gestione Outbound Drag Ghost & Rilascio fuori finestra
         if let Some(dragged) = self.dragging_entry.clone() {
             if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
                 self.last_drag_pos = Some(pos);
@@ -1208,7 +1963,7 @@ impl eframe::App for SecureUsbApp {
                             ui.strong(format!("📤 Esporta {icon}: {}", dragged.virtual_path));
                             ui.colored_label(
                                 Color32::from_rgb(16, 185, 129),
-                                "➔ Rilascia nella Dock in basso o sul bordo esterno della finestra per esportare sul Desktop!",
+                                "➔ Rilascia nella Dock in basso o oltre il bordo esterno per esportare sul Desktop!",
                             );
                         });
                     });
@@ -1229,16 +1984,9 @@ impl eframe::App for SecureUsbApp {
             }
         }
 
-        if let Some(entry) = treemap_clicked {
-            self.select_entry(ctx, &entry);
-        }
-
-        if let Some((path, data)) = save_target {
-            if let Some(v) = &self.vault {
-                let _ = v.write_file(&path, &data);
-                self.status_msg = format!("✅ Salvato {path}!");
-            }
-            self.refresh_dir();
+        // Esegue tutte le azioni raccolte senza conflitti di prestito
+        if !actions.is_empty() {
+            self.process_ui_actions(ctx, actions);
         }
     }
 }

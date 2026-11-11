@@ -138,7 +138,13 @@ pub fn verify_and_heal_with_ecc(target_path: &Path) -> io::Result<(bool, usize)>
         off += 32;
     }
 
-    let raw_data = fs::read(target_path).unwrap_or_default();
+    let raw_data = match fs::read(target_path) {
+        Ok(data) => data,
+        // Un file mancante può essere ricostruito dai quattro shard di parità;
+        // gli altri errori devono invece interrompere la riparazione.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err),
+    };
     let mut shards = vec![vec![0u8; shard_size]; RS_TOTAL_SHARDS];
     let mut valid = [false; RS_TOTAL_SHARDS];
     let mut damaged_count = 0usize;

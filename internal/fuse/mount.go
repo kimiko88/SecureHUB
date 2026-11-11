@@ -231,9 +231,12 @@ func (f *VaultFuseFS) Write(path string, buff []byte, ofst int64, fh uint64) int
 }
 
 func (f *VaultFuseFS) Flush(path string, fh uint64) int {
+	// Keep the handle locked while persisting its buffer: a concurrent Write
+	// must not race with the snapshot or be lost when dirty is cleared.
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	h, ok := f.handles[fh]
-	f.mu.Unlock()
 	if !ok {
 		return 0
 	}

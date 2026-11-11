@@ -161,24 +161,32 @@ func (f *VaultFuseFS) Open(path string, flags int) (int, uint64) {
 }
 
 func (f *VaultFuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
+	if ofst < 0 {
+		return -fuse.EINVAL
+	}
+
 	f.mu.Lock()
 	h, ok := f.handles[fh]
-	f.mu.Unlock()
 	if !ok {
+		f.mu.Unlock()
 		return -fuse.EBADF
 	}
-
 	if h.dirty {
 		if ofst >= int64(len(h.buf)) {
+			f.mu.Unlock()
 			return 0
 		}
-		return copy(buff, h.buf[ofst:])
+		n := copy(buff, h.buf[int(ofst):])
+		f.mu.Unlock()
+		return n
 	}
+	seeker := h.seeker
+	f.mu.Unlock()
 
-	if h.seeker == nil {
+	if seeker == nil {
 		return -fuse.EIO
 	}
-	n, err := h.seeker.ReadAt(buff, ofst)
+	n, err := seeker.ReadAt(buff, ofst)
 	if err != nil && err != io.EOF {
 		return -fuse.EIO
 	}
@@ -186,6 +194,10 @@ func (f *VaultFuseFS) Read(path string, buff []byte, ofst int64, fh uint64) int 
 }
 
 func (f *VaultFuseFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
+	if ofst < 0 || uint64(ofst) > uint64(^uint(0)>>1)-uint64(len(buff)) {
+		return -fuse.EINVAL
+	}
+
 	f.mu.Lock()
 	h, ok := f.handles[fh]
 	if !ok {
@@ -199,9 +211,11 @@ func (f *VaultFuseFS) Write(path string, buff []byte, ofst int64, fh uint64) int
 			h.seeker = nil
 		}
 		existing, err := f.vault.ReadFile(path)
-		if err == nil {
-			h.buf = existing
+		if err != nil {
+			f.mu.Unlock()
+			return -fuse.EIO
 		}
+		h.buf = existing
 		h.dirty = true
 	}
 
@@ -211,7 +225,7 @@ func (f *VaultFuseFS) Write(path string, buff []byte, ofst int64, fh uint64) int
 		copy(newBuf, h.buf)
 		h.buf = newBuf
 	}
-	copy(h.buf[ofst:], buff)
+	copy(h.buf[int(ofst):], buff)
 	f.mu.Unlock()
 	return len(buff)
 }

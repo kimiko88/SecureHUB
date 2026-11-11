@@ -165,7 +165,12 @@ func VerifyAndHealWithECC(targetPath string) (healed bool, damagedShards int, er
 		offset += 32
 	}
 
-	rawData, _ := os.ReadFile(targetPath)
+	rawData, readErr := os.ReadFile(targetPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		// Non confondere un errore di permessi/I/O con un file cancellato:
+		// altrimenti la procedura potrebbe ricostruire e sovrascrivere dati.
+		return false, damagedShards, readErr
+	}
 	shards := make([][]byte, rsTotalShards)
 	validShard := make([]bool, rsTotalShards)
 

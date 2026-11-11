@@ -141,7 +141,10 @@ func VerifyAndHealWithECC(targetPath string) (healed bool, damagedShards int, er
 	eccPath := targetPath + ".ecc"
 	eccRaw, err := os.ReadFile(eccPath)
 	if err != nil {
-		return false, 0, nil // Sidecar non presente: continua normalmente
+		if os.IsNotExist(err) {
+			return false, 0, nil // Sidecar assente: nessun controllo ECC disponibile.
+		}
+		return false, 0, err
 	}
 
 	const fixedHdr = 8 + 12 + (rsTotalShards * 32)

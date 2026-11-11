@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -229,8 +230,16 @@ func (v *SecureVault) ChangePassword(oldPassword, newPassword string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if _, err := v.unwrapDEK(oldPassword, v.salt); err != nil {
+	verifiedDEK, err := v.unwrapDEK(oldPassword, v.salt)
+	if err != nil {
 		return errors.New("la password attuale inserita non è corretta")
+	}
+	matchesCurrentKey := subtle.ConstantTimeCompare(verifiedDEK, v.dek) == 1
+	for i := range verifiedDEK {
+		verifiedDEK[i] = 0
+	}
+	if !matchesCurrentKey {
+		return errors.New("il vault.key non corrisponde alla chiave del Vault attualmente aperto")
 	}
 
 	newSalt := make([]byte, SaltSize)

@@ -86,18 +86,25 @@ func (s *VaultReadSeeker) Seek(offset int64, whence int) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var newPos int64
+	var base int64
 	switch whence {
 	case io.SeekStart:
-		newPos = offset
+		base = 0
 	case io.SeekCurrent:
-		newPos = s.pos + offset
+		base = s.pos
 	case io.SeekEnd:
-		newPos = s.entry.OriginalSize + offset
+		base = s.entry.OriginalSize
 	default:
 		return 0, errors.New("whence non valido in Seek")
 	}
 
+	// Evita overflow signed quando si sommano offset non attendibili provenienti
+	// da chiamanti FUSE, parser o viewer.
+	if (offset > 0 && base > int64(^uint64(0)>>1)-offset) ||
+		(offset < 0 && base < (-int64(^uint64(0)>>1)-1)-offset) {
+		return 0, errors.New("offset fuori intervallo in Seek")
+	}
+	newPos := base + offset
 	if newPos < 0 {
 		return 0, errors.New("seek a posizione negativa non consentito")
 	}

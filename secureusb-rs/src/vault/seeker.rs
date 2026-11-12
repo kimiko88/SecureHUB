@@ -146,18 +146,18 @@ impl VaultReadSeeker {
 
 impl Seek for VaultReadSeeker {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let new_pos: i64 = match pos {
-            SeekFrom::Start(o) => o as i64,
-            SeekFrom::Current(d) => (self.pos as i64) + d,
-            SeekFrom::End(d) => (self.entry.original_size as i64) + d,
-        };
-        if new_pos < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Seek negativo non consentito",
-            ));
+        let new_pos = match pos {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+            SeekFrom::End(delta) => self.entry.original_size.checked_add_signed(delta),
         }
-        self.pos = new_pos as u64;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Posizione di seek fuori dall'intervallo u64",
+            )
+        })?;
+        self.pos = new_pos;
         Ok(self.pos)
     }
 }
@@ -239,30 +239,69 @@ fn handle_http_range_client(
     let mut range_start: u64 = 0;
     let mut range_end: u64 = total_size.saturating_sub(1);
     let mut is_partial = false;
+    let is_head = parts[0] == "HEAD";
+
+    if parts[0] != "GET" && !is_head {
+        stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+        return Ok(());
+    }
 
     for line in lines {
-        if line.to_ascii_lowercase().starts_with("range:") {
-            if let Some( idx) = line.find("bytes=") {
-                let spec = line[idx + 6..].trim();
-                if let Some((s, e)) = spec.split_once('-') {
-                    if let Ok(st) = s.parse::<u64>() {
-                        range_start = st;
-                        is_partial = true;
-                    }
-                    if let Ok(en) = e.parse::<u64>() {
-                        range_end = en.min(total_size.saturating_sub(1));
-                    }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("range") {
+                let Some(spec) = value.trim().strip_prefix("bytes=") else {
+                    stream.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                    return Ok(());
+                };
+                // Multi-range e suffix-range non sono supportati: rifiutali invece
+                // di restituire una risposta 206 incoerente.
+                if spec.contains(',') {
+                    stream.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                    return Ok(());
                 }
+                let Some((start, end)) = spec.split_once('-') else {
+                    stream.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                    return Ok(());
+                };
+                if start.is_empty() {
+                    stream.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                    return Ok(());
+                }
+                range_start = match start.parse::<u64>() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        stream.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                        return Ok(());
+                    }
+                };
+                range_end = if end.is_empty() {
+                    total_size.saturating_sub(1)
+                } else {
+                    match end.parse::<u64>() {
+                        Ok(value) => value.min(total_size.saturating_sub(1)),
+                        Err(_) => {
+                            stream.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                            return Ok(());
+                        }
+                    }
+                };
+                is_partial = true;
             }
         }
     }
 
     if total_size == 0 {
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        stream.write_all(b"HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+        return Ok(());
+    }
+    if range_start >= total_size || range_start > range_end {
+        stream.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */")?;
+        stream.write_all(total_size.to_string().as_bytes())?;
+        stream.write_all(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
         return Ok(());
     }
 
-    let content_len = range_end.saturating_sub(range_start) + 1;
+    let content_len = range_end - range_start + 1;
     if is_partial {
         let header = format!(
             "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {range_start}-{range_end}/{total_size}\r\nContent-Length: {content_len}\r\nConnection: close\r\n\r\n"
@@ -273,6 +312,10 @@ fn handle_http_range_client(
             "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {total_size}\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(header.as_bytes())?;
+    }
+
+    if is_head {
+        return Ok(());
     }
 
     seeker.seek(SeekFrom::Start(range_start))?;

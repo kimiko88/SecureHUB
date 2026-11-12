@@ -114,8 +114,10 @@ pub fn write_ecc_sidecar(target_path: &Path) -> io::Result<()> {
 /// fino a 4 shard danneggiati da bit-rot su 12 prima della decifratura Poly1305.
 pub fn verify_and_heal_with_ecc(target_path: &Path) -> io::Result<(bool, usize)> {
     let ecc_path = Path::new(&format!("{}.ecc", target_path.display())).to_path_buf();
-    let Ok(ecc_raw) = fs::read(&ecc_path) else {
-        return Ok((false, 0));
+    let ecc_raw = match fs::read(&ecc_path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((false, 0)),
+        Err(err) => return Err(err),
     };
 
     let fixed_hdr = 8 + 12 + (RS_TOTAL_SHARDS * 32);
@@ -136,7 +138,13 @@ pub fn verify_and_heal_with_ecc(target_path: &Path) -> io::Result<(bool, usize)>
         off += 32;
     }
 
-    let raw_data = fs::read(target_path).unwrap_or_default();
+    let raw_data = match fs::read(target_path) {
+        Ok(data) => data,
+        // Un file mancante può essere ricostruito dai quattro shard di parità;
+        // gli altri errori devono invece interrompere la riparazione.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err),
+    };
     let mut shards = vec![vec![0u8; shard_size]; RS_TOTAL_SHARDS];
     let mut valid = [false; RS_TOTAL_SHARDS];
     let mut damaged_count = 0usize;

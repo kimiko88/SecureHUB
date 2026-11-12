@@ -141,7 +141,10 @@ func VerifyAndHealWithECC(targetPath string) (healed bool, damagedShards int, er
 	eccPath := targetPath + ".ecc"
 	eccRaw, err := os.ReadFile(eccPath)
 	if err != nil {
-		return false, 0, nil // Sidecar non presente: continua normalmente
+		if os.IsNotExist(err) {
+			return false, 0, nil // Sidecar assente: nessun controllo ECC disponibile.
+		}
+		return false, 0, err
 	}
 
 	const fixedHdr = 8 + 12 + (rsTotalShards * 32)
@@ -162,7 +165,12 @@ func VerifyAndHealWithECC(targetPath string) (healed bool, damagedShards int, er
 		offset += 32
 	}
 
-	rawData, _ := os.ReadFile(targetPath)
+	rawData, readErr := os.ReadFile(targetPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		// Non confondere un errore di permessi/I/O con un file cancellato:
+		// altrimenti la procedura potrebbe ricostruire e sovrascrivere dati.
+		return false, damagedShards, readErr
+	}
 	shards := make([][]byte, rsTotalShards)
 	validShard := make([]bool, rsTotalShards)
 
